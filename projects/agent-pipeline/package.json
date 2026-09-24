@@ -2,9 +2,10 @@
   "name": "agent-pipeline",
   "version": "0.0.1",
   "private": true,
-  "description": "Multi-agent product-development pipeline built on the Claude Agent SDK (Phase 0 scaffold).",
+  "description": "Multi-agent product-development pipeline built on the Claude Agent SDK, with a local web UI (`npm start`).",
   "type": "module",
   "scripts": {
+    "start": "tsx ui/server.ts",
     "orchestrator": "tsx orchestrator/run.ts",
     "typecheck": "tsc --noEmit"
   },

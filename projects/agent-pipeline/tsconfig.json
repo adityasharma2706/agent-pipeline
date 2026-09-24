@@ -16,6 +16,6 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["orchestrator/**/*.ts"],
+  "include": ["orchestrator/**/*.ts", "ui/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

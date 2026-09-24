@@ -57,6 +57,7 @@ import {
 } from "./state.js";
 import { PROJECT_ROOT, loadAgentDefinition } from "./agent-loader.js";
 import { PIPELINE_STAGES } from "./types.js";
+import { LAST_IMPLEMENTED_STAGE, NOT_IMPLEMENTED_REASONS } from "./stage-meta.js";
 import type {
   AgentName,
   PipelineStage,
@@ -127,26 +128,9 @@ const DEFAULT_MAX_MODULES = 2;
 /** The phase this build implements, used only for console/error wording. */
 const CURRENT_PHASE = 5;
 
-/**
- * The last stage in the linear order that this build can run. Reaching it
- * successfully is what triggers the feedback loop, not the end of the run.
- */
-const LAST_IMPLEMENTED_STAGE: PipelineStage = "reviewer";
-
-/**
- * Why a stage is not implemented, where "not implemented yet" is not the real
- * answer. Read by stageIo() so the error a human sees says what is actually
- * blocking rather than just naming a phase number.
- */
-const NOT_IMPLEMENTED_REASONS: Partial<Record<PipelineStage, string>> = {
-  "testing-agent":
-    'Stage "testing-agent" is blocked on module M18 (the sandbox executor), not merely unscheduled. ' +
-    "It runs end-to-end tests via Playwright, which needs a shell. Decision LD-1 in docs/lld.md " +
-    "(line ~396) requires ALL command execution to go through a custom `sandbox_exec` MCP tool " +
-    "created with createSdkMcpServer, and to NEVER enable native Bash. M18 is that tool and has " +
-    "not been built. Giving testing-agent Bash instead would violate the pipeline's own generated " +
-    "design, so it stays unimplemented until M18 ships.",
-};
+// LAST_IMPLEMENTED_STAGE and NOT_IMPLEMENTED_REASONS moved to
+// ./stage-meta.ts so the local UI server can read them without importing the
+// Agent SDK. They are re-exported below for anything that imported them here.
 
 /**
  * Where docs/feedback_log.md lives — reviewer writes it, feedback-router reads
@@ -1117,6 +1101,7 @@ function nextLinearStage(current: PipelineStage | null): PipelineStage | null {
 
 // Re-exported so future phases (and tests) can reference them without
 // reaching into this file's internals.
+export { LAST_IMPLEMENTED_STAGE, NOT_IMPLEMENTED_REASONS };
 export {
   runStage,
   invokeFeedbackRouter,

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agent-pipeline</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <h1>agent-pipeline</h1>
+        <span class="muted" id="projectRoot"></span>
+      </div>
+      <div class="topbar-right">
+        <span class="pill" id="authPill">auth: checking…</span>
+        <span class="pill" id="runPill">idle</span>
+      </div>
+    </header>
+
+    <div id="banner" class="banner hidden" role="alert"></div>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab" data-tab="dashboard" role="tab">Dashboard</button>
+      <button class="tab" data-tab="run" role="tab">Run</button>
+      <button class="tab" data-tab="artifacts" role="tab">Artifacts</button>
+      <button class="tab" data-tab="routing" role="tab">Routing log</button>
+      <button class="tab" data-tab="settings" role="tab">Settings</button>
+    </nav>
+
+    <main>
+      <!-- ---------------- Dashboard ---------------- -->
+      <section id="tab-dashboard" class="panel">
+        <div class="section-head">
+          <h2>Pipeline stages</h2>
+          <button class="ghost" id="refreshDashboard">Refresh</button>
+        </div>
+        <p class="muted" id="dashboardSummary"></p>
+        <ol class="stages" id="stageList"></ol>
+
+        <h2>Module progress</h2>
+        <div id="workspaceBox"></div>
+      </section>
+
+      <!-- ---------------- Run ---------------- -->
+      <section id="tab-run" class="panel">
+        <div class="cost-warning">
+          <strong>Starting a run spends real money.</strong>
+          It calls the Anthropic API through the orchestrator CLI and bills whichever credential is
+          configured under Settings. The run budget is capped at $25 cumulative and $4 per call by the
+          orchestrator itself — but that cap is a ceiling, not a promise of a small bill.
+        </div>
+
+        <div class="run-grid">
+          <div>
+            <label for="idea">Product idea</label>
+            <textarea
+              id="idea"
+              rows="6"
+              placeholder="Leave blank to resume the existing run using the idea already in docs/idea.md."
+            ></textarea>
+            <p class="hint">
+              Leave this empty to <strong>resume</strong>: the orchestrator reads docs/idea.md and
+              continues from the last stage that succeeded. Typing a different idea mid-run replaces
+              docs/idea.md and the CLI will warn that earlier stages ran against the old one.
+            </p>
+          </div>
+          <div class="run-controls">
+            <label for="maxModules">--max-modules</label>
+            <input id="maxModules" type="number" min="1" value="2" />
+            <p class="hint">Modules spec-implementer may build this invocation.</p>
+
+            <label for="maxGoBacks">--max-go-backs</label>
+            <input id="maxGoBacks" type="number" min="1" value="3" />
+            <p class="hint">Feedback-router go-backs allowed this run.</p>
+
+            <div class="run-buttons">
+              <button class="danger" id="startRun">Start / Resume run ($)</button>
+              <button class="ghost" id="stopRun" disabled>Stop</button>
+            </div>
+            <div class="cost-readout">
+              <span class="muted">This run so far</span>
+              <strong id="costReadout">$0.0000</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-head">
+          <h2>Live output</h2>
+          <label class="inline"><input type="checkbox" id="autoscroll" checked /> autoscroll</label>
+        </div>
+        <pre id="console" class="console" aria-live="polite"></pre>
+      </section>
+
+      <!-- ---------------- Artifacts ---------------- -->
+      <section id="tab-artifacts" class="panel">
+        <div class="artifact-layout">
+          <aside>
+            <div class="section-head"><h2>docs/</h2><button class="ghost" id="refreshArtifacts">Refresh</button></div>
+            <ul class="artifact-list" id="artifactList"></ul>
+          </aside>
+          <article class="doc" id="artifactView">
+            <p class="muted">Select a document.</p>
+          </article>
+        </div>
+      </section>
+
+      <!-- ---------------- Routing ---------------- -->
+      <section id="tab-routing" class="panel">
+        <div class="section-head">
+          <h2>Routing decisions</h2>
+          <button class="ghost" id="refreshRouting">Refresh</button>
+        </div>
+        <p class="muted">
+          Every feedback-router decision from state/routing.jsonl, enacted or not. Rejected decisions
+          are kept deliberately — measuring routing accuracy needs the whole sample.
+        </p>
+        <div id="routingList"></div>
+      </section>
+
+      <!-- ---------------- Settings ---------------- -->
+      <section id="tab-settings" class="panel">
+        <div id="claudeSettings">
+          <h2>Anthropic API key</h2>
+          <p class="muted" id="authDetail"></p>
+          <div class="key-row">
+            <input
+              id="apiKey"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="sk-ant-..."
+            />
+            <button id="saveKey">Save key</button>
+          </div>
+          <p class="hint">
+            The key is written to <code>.env</code> in the project root with file mode 0600, which is
+            the same file the orchestrator already reads. It is <strong>write-only</strong> over
+            HTTP: this page can send a key but can never read one back, not even masked. To remove a
+            key, delete the <code>ANTHROPIC_API_KEY</code> line from <code>.env</code> by hand.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
