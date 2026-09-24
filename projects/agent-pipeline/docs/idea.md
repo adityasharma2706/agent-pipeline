@@ -2,4 +2,4 @@
 
 # Product idea
 
-I want to build a website which can find clients and connection details for export business. I am from India.
+I want to build a website which can find clients and connection details for export business. I am from India

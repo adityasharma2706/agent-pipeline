@@ -1,526 +1,528 @@
 <!-- Written by: system-design stage (high-level design). Read by: low-level-design. -->
 
-# High-Level Design: Idea-to-Tested-Software Pipeline
+# High-Level Design: Export Buyer Discovery for Indian Exporters
 
-**Summary**
-- This document describes how the 36 modules in `docs/implementer.md` (M01–M36) fit together at runtime. It is organised in layers, with one owning module for each shared data structure, a small set of interfaces between modules, and nine key interaction flows.
-- There is one process per CLI invocation and two entry points. The **run path** (M12 Run Controller) holds the project run lock. The **critic path** (M30) never holds that lock and communicates with the run path only through durable files, the signal queue and the ledger.
-- The whole system hangs on four seams. **Documents + ID blocks** (M02) are the content contract. The **Trace graph** (M08) and the **Stale set** (M09) are the derived knowledge. **Work units + safe points** (M12/M04) are the control contract. The **Signal → Issue → Routing Decision** chain (M04 → M25 → M26 → M27 → M28) is the feedback contract.
-- Every module writes durable state to exactly one kind of store. Only M03 commits to git, only M06 calls the model, and only M18 executes generated code. Almost all cross-cutting guarantees (REQ-017, REQ-056, REQ-072, REQ-074) are enforced at those three choke points.
-- Per-function signatures, file schemas and prompt text are deliberately left to low-level design. §12 lists the decisions this document makes where the upstream documents were silent (for example, M04 owns the signal queue).
-
-Requirement IDs refer to `docs/design.md` §7, component and AD numbers refer to `docs/architecture.md`, and module IDs refer to `docs/implementer.md`.
+> **Scope:** how the modules in `docs/implementer.md` (`M01`…`M53`) fit together. It covers runtime shape, which module owns which data, the interfaces between modules, key data structures (at the conceptual level), cross-module events, and the main interaction sequences. It does **not** give per-function signatures, table DDL, algorithms or thresholds. Low-level design (LLD) specifies those from this document.
+>
+> **Inputs:** `docs/design.md` (REQ-001…REQ-066), `docs/architecture.md`, `docs/implementer.md`.
+>
+> **Conventions**
+> - Every interface (`IF-xx`), data structure (`DS-xx`) and event (`EV-xx`) names the module that **owns** it and the modules that **use** it, with module IDs exactly as written in `docs/implementer.md`.
+> - Where an interface exists for a specific requirement, the `REQ-` IDs it carries are listed.
+> - Field lists in data structures are *conceptual* (what must be representable). LLD decides names, types, keys and indexes.
+> - Anything marked **[assumption]** is a decision made here with no human to ask. Section 11 lists them all again.
 
 ---
 
-## 1. System shape
+## 1. Design goals carried from architecture
 
-### 1.1 Layers
+The HLD makes the architecture's drivers enforceable at module boundaries:
 
-Modules are grouped into five layers. **Dependency rule:** a module may call modules in its own layer or any layer below it, and never a layer above. Upward communication goes only through durable records (events, signals, ledger entries) that the upper layer reads. The only exceptions are the explicitly registered callbacks in §1.3.
-
-| Layer | Purpose | Modules |
+| Goal | How this HLD enforces it | Modules |
 |---|---|---|
-| **L5 Interface** | Parse verbs, render progress, status, escalation blocks and consent prompts. No business logic. | M13, M17 (verbs part), M29 (verbs part), M30 (`critic` verb), M32 (`finding` verbs), M35 (`baseline` verb), M36 |
-| **L4 Control** | Decide what runs next and whether rework happens | M12, M17 (policy part), M25, M26, M27, M28, M29 (gate-override part), M33, M34 (suggestion part) |
-| **L3 Work** | Carry out one unit of work: produce a document, code, findings or verdicts | M10, M11, M16, M19, M20, M21, M22, M23, M24, M30, M31, M35 |
-| **L2 Knowledge** | Derived views over the durable state: parsing, trace, staleness, rendering | M02, M07, M08, M09, M14, M15 |
-| **L1 Infrastructure** | The single choke points for external effects, plus durable state | M01, M03, M04, M05, M06, M18 |
+| Every fact has provenance (D1) | Only M09 writes buyer facts. All writers go through `IF-09a AssertionWrite`, which rejects a write that has no source-register entry. | M08, M09 |
+| One policy gate on every read (D2) | Serving modules never read buyer read-models directly. They call `IF-10a PolicyGate`, which returns filtered documents plus allowed actions. | M10, all readers |
+| Planes stay decoupled | The knowledge and serving planes interact only through **jobs/events** (M02) and **read models** (M09, M14, M15). There are no synchronous cross-plane calls, with one listed exception (§3.4). | M02, M09 |
+| Credits are auditable and refundable (D7) | All credit movement goes through `IF-28a Ledger`, using idempotency keys and hold/commit/refund. | M28 |
+| Nothing costly or legally sensitive happens without a check | Reveal and draft call the sanctions screener synchronously (`IF-17a`) and the policy gate before acting. | M17, M29, M34 |
 
-M14 (Reporter) and M15 (Decision Log) sit in L2 because they are pure *renderers* over durable state. They are *triggered* by L4 (M12 at every stop) but never call into L4.
+---
 
-### 1.2 Choke points (single owners of external effects)
+## 2. System shape
 
-| Effect | Sole owner | What this guarantees | REQs |
+### 2.1 Runtime units
+
+| Runtime unit | Language | What runs in it | Modules hosted |
 |---|---|---|---|
-| Model/API calls | **M06** Agent Host Adapter | Every call is budget-checked and metered, runs under a permission profile, starts a fresh session and is logged | REQ-062, REQ-070, REQ-072, REQ-074, REQ-081 |
-| Git writes (commit, branch) | **M03** VCS Gateway | One commit per unit with trailers, on the `pipeline/<run-id>` branch; non-pipeline changes detectable | REQ-017, REQ-038, REQ-063 |
-| Execution of generated code | **M18** Sandbox Manager | Isolation, and consent before the first execution in a run | REQ-056 |
-| Run-state mutation | **M04** Run State/Event Log/Lock | Atomic snapshots, append-only events, one active run | REQ-005, REQ-006, REQ-009 |
-| Spend accounting | **M05** Ledger | Budget enforced before every call; attribution by run, stage, increment, go-back and critic | REQ-070–REQ-075 |
+| **R1 Web/API monolith** | TypeScript | SSR front end, JSON API, admin console, webhook endpoints | M04, M05, M06, M07, M10 (TS side), M11, M13, M16, M26, M27, M28, M29, M30, M31, M32, M33, M34, M35 (request side), M36, M37, M38 (request side), M40–M52 (serving parts) |
+| **R2 Serving workers** | TypeScript | Serving-plane async jobs: exports, data-rights jobs, reminders, notifications, billing reconciliation, reveal-time re-verification orchestration | M35, M38, M41, M36 (reconcile), M30 (refund follow-through), M45 |
+| **R3 Knowledge workers** | Python | Connectors, ingestion, entity resolution, classification, discovery, enrichment, trust, coverage, market analytics, projection builder | M08, M09 (write + projection), M12, M14, M15, M17, M18, M19, M20, M21, M22, M23, M24, M25, M53 |
+| **R4 Scheduler** | (M02) | Cron triggers that enqueue jobs into R2/R3 queues | M02 |
+| **Shared infra** | — | Postgres (`serving`, `knowledge`, `ledger`, `analytics` schemas + pgvector), Redis, S3, secrets, observability | M01 |
 
-Low-level design must not introduce a second path to any of these effects. For example, M22/M23 do not shell out directly; they go through M18.
+**[assumption]** R2 and R1 are the same codebase deployed as two process types. R3 is a separate deployable. M02 gives both languages a client for the same Postgres-backed queue, so jobs can cross planes.
 
-### 1.3 Registered callbacks (the only upward calls)
-
-1. **Shell-execution hook in M06 → M18.** M06 is built before M18 and defaults to *deny* for all shell tool use. M18 registers itself as the shell executor when present, so agent shell calls are routed into the sandbox (REQ-056).
-2. **Budget signals from M05 → M12.** M05 raises `budget_warning` and `budget_exhausted` as events in M04's log and as an in-process notification. M12 acts on the notification only at the next safe point (REQ-073, REQ-075).
-3. **Stage hooks in M07 → L3/L4.** Stage manifests may name post-stage hooks: consistency check after design, architecture and impl-plan (M16), and the critic auto-invoke point (M33). M12 runs them; M07 only declares them.
-
-### 1.4 Runtime topology
+### 2.2 Layering inside the serving monolith (R1/R2)
 
 ```
-                    ┌──────────────── one CLI process ────────────────┐
- pipeline start ──▶ │ M13 ─▶ M12 ─▶ (M10 | M19 | M20 | M21 | M16) ... │ holds run lock (M04)
- pipeline resume    │         └─▶ M25 → M26 → M27 → M28 (rework)       │
- pipeline status    │ M13 ─▶ M14 (read-only render)                    │ no lock
- pipeline critic    │ M30/M31 ─▶ M06, M18 (read snapshot @HEAD)        │ no run lock (AD-15)
- pipeline finding   │ M32 ─▶ M04 signal queue                          │ no run lock
-                    └─────────────────────────────────────────────────┘
-        shared durable state: docs/ (git), .pipeline/{state.json, events, ledger, signals,
-        routing, findings, trace, hashes, evidence, logs}
+ Layer 4  UI / API routes          M04 shell + page modules (M13, M16, M26, M27, M29–M37, M40–M52)
+ Layer 3  Serving domain modules   M07 Workspace · M26 Search · M27 Profile · M29 Reveal · M30 Reports
+                                   M32 Check · M33 Pipeline · M34 Drafts · M35 Export · M36 Billing · M41 Notify
+ Layer 2  Governance & money       M10 PolicyGate/Suppression · M11 ReviewQueue · M28 Ledger/Prices · M06 Consent
+ Layer 1  Platform                 M01 data access/tenancy/cost · M02 jobs/events · M03 LLM · M05 identity
 ```
 
-- **Concurrency model.** There is at most one *writer of run progress* (the lock holder). Critic and finding processes may run at the same time and may write only to append-only stores: `ledger.jsonl`, `signals.jsonl`, `findings.jsonl`, `docs/critic/*`, evidence and logs. `status` is read-only. Appends to these stores must be atomic per record (see §10.3).
-- **Critic commits.** Critic reports under `docs/critic/` are **not** committed by the critic process, because it doesn't hold the run lock. M03 picks them up in the next pipeline commit, or the user commits them. See open question 2.
+Rules:
+1. A module may call modules in its own layer or lower layers only. Layer 2 never calls Layer 3. Instead, Layer 3 modules **register providers or handlers** with Layer 2 (see `IF-10b`, `IF-11b`). This keeps the policy layer and review queue generic.
+2. **No Layer 3 or 4 module reads `knowledge` schema tables directly.** Buyer data reaches them only as policy-filtered documents from `IF-10a`, which reads M09 read models on their behalf. M14/M15 read models (market stats, coverage) are not buyer data about companies or people, so M16/M26 may read them directly through `IF-14a`/`IF-15a`.
+3. Each table has **exactly one owning module**. Other modules use the owner's interface. §4 lists ownership.
+
+### 2.3 Layering inside the knowledge plane (R3)
+
+```
+ Sources ─► M08 Connector framework + licence register ─► raw landing (S3)
+                 │
+                 ├─ M12 HS loaders      M14 Comtrade/FTA        M17 Sanctions lists
+                 ├─ M20 Web discovery   M21 US customs          M23 Registries/domain  M53 (later)
+                 ▼
+          M18 Entity resolution (checks M10 suppression) ─► M19 Classifiers
+                 ▼
+          M09 Evidence store  (IF-09a AssertionWrite: single write path)
+                 │  emits EV-01 EntityChanged
+                 ├─► M22 Enrichment (contacts)   ├─► M24 Trust engine   ├─► M17 screening
+                 ├─► M09 Projection builder ─► buyer read models (profile doc, search doc)
+                 └─► M15 Coverage builder (batched)       M25 Freshness scheduler (periodic)
+```
+
+Knowledge modules call each other in-process as Python libraries inside a job, or chain through jobs. Fan-out from `EV-01` is event-driven so that a new consumer (for example M48 similarity) can be added without touching the producers.
 
 ---
 
-## 2. Core data structures
+## 3. Cross-cutting mechanisms
 
-Each structure has one **owning module** that defines it and is the only writer of its durable form. Other modules read it. Fields are listed at the conceptual level; exact schemas belong to low-level design.
+### 3.1 Tenancy and scoping (M01, M07)
 
-### 2.1 Configuration and registry
+- Serving data is scoped by **Account → Workspace**. M01 provides `IF-01a ScopedDataAccess`: every serving query runs with an **actor context** (`DS-01 ActorContext`) and the helper adds account/workspace predicates. Optional Postgres RLS sits underneath. *(REQ-008, REQ-063)*
+- **Account-scoped:** ledger, plan/subscription, revealed-contact records, exports, consent, business profile. **Workspace-scoped:** HS code, shortlisted countries, searches, shortlist entries, notes, drafts, reminders. **[assumption]** Credits live at account level. M52 (consultant, per-client credits) will add optional sub-balances keyed by workspace rather than moving the ledger.
+- Knowledge data (companies, assertions) is **global and shared across tenants** (the cross-user cache, D5). Per-user views of it (hides, reveals) live in serving tables owned by M30/M29.
 
-| Structure | Owner | Key contents | Consumers | REQs |
+### 3.2 Jobs, events and the outbox (M02)
+
+- `IF-02a JobQueue`: enqueue a typed job with an idempotency key, a target queue (serving or knowledge), a vendor rate-limit class and a retry policy. Both languages have a client.
+- `IF-02b Schedule`: cron-style registrations, declared by each owning module.
+- `IF-02c EventBus`: domain events (`EV-xx`, §6) are written to an **outbox in the same transaction** as the state change. A dispatcher then turns them into jobs for the subscribed handlers. Subscriptions are declared by consumer modules. Delivery is at least once, so handlers must be idempotent.
+- Dead-lettered jobs are visible in the M11 console as a system item type **[assumption]**, so failures in refunds and data rights are not lost silently.
+
+### 3.3 Cost metering (M01, M03)
+
+`IF-01b CostMeter` records vendor spend for each call, tagged with job type, account (if any) and credit reference (if any). M03, M08-based connectors, M23, M25 and M36 must call it. M39 builds the cost-per-credit dashboard from this data.
+
+### 3.4 Cross-plane synchronous exceptions
+
+The serving plane may call knowledge-plane logic **synchronously** only in these cases, all bounded by latency targets:
+
+| Exception | Caller | Callee | Why | REQs |
 |---|---|---|---|---|
-| **Policy** | M01 | budget default, stage shares, model tier map, checkpoint list, router thresholds and caps (go-backs per run, attempts per issue), unattended hand-edit policy, sandbox mode, critic auto-invoke point, flake re-run count, warning threshold, standalone critic cap | all | REQ-003, REQ-027, REQ-037, REQ-049, REQ-070, REQ-071 |
-| **StageManifest** | M07 | stage id, output document path, required inputs (doc / section / ID kinds), role template ref, model tier, permission profile, budget share, checkpoint-capable flag, profiles membership, post-stage hooks, *upstream stage ids* (edges of the stage dependency graph) | M09, M10, M11, M12, M19, M20, M21, M33, M34 | REQ-008, REQ-010, REQ-013, REQ-071 |
-| **ModeProfile** | M07 (mechanism), M34 (`fast` content) | ordered list of stage ids for `full` or `fast` | M12 | REQ-008 |
-| **PermissionProfile** | M06 | `read-only`, `docs-write` (docs/ only), `code-write` (worktree only, shell → sandbox) | M07 manifests reference it by name | REQ-018, REQ-047, REQ-056 |
-| **RoleTier** | M06 (resolution), M01 (map) | `strong` / `standard` / `fast` → model | M06 | AD-13 |
+| Sanctions screen on reveal/draft | M29, M34, M32 | M17 via `IF-17a` | Must be current at the moment of action | REQ-029 |
+| Ad-hoc trust checks | M32 | M24 via `IF-24b` | Interactive tool | REQ-030 |
+| Reveal-time re-verification | M29 | M25 via `IF-25a` (request/await with timeout) | Stale contacts must be re-checked before display | REQ-033, REQ-034 |
 
-### 2.2 Documents and derived knowledge
+**[assumption]** These are exposed as a small **internal HTTP service inside R3** (one "knowledge RPC" endpoint group). They are not called as cross-language libraries. Everything else crosses the planes through M02.
 
-| Structure | Owner | Key contents | Consumers | REQs |
-|---|---|---|---|---|
-| **StageDocument** | M02 (model); written by the stage's L3 module | header comment (writer/readers), front-matter (`stage`, `run_id`, `generated_from`, `schema_version`), summary, sections, ID blocks, Assumptions, Open questions | M08, M09, M10, M14, M15, M16, M17, M21, M26, M30 | REQ-004, REQ-011, REQ-012 |
-| **IdBlock** | M02 | id (kind + number: REQ, AD, T, INC, E2E, F), location (doc, heading/row), body, content hash, outgoing references (`REQ-nnn` tokens etc.), kind-specific attributes (REQ: priority + acceptance intent; AD: status/superseded-by; T/INC: REQ refs) | M08, M09, M10 (Preservation Guard), M16 | REQ-020–REQ-023 |
-| **ContractViolation** | M02 | rule broken, location, severity (blocking or warning) | M10 (re-prompt/escalate), M16 | REQ-004, REQ-011, REQ-012 |
-| **OpenQuestion** | M02 (extraction), M09 (answered state) | source doc and section, text, answered flag, answer text | M14 roll-up, M17 | REQ-028, REQ-061 |
-| **TraceGraph** | M08 | nodes = ID blocks + commits + verdicts + evidence refs; typed edges REQ→AD, REQ→T, T→INC, INC→commit, REQ→E2E, E2E→Verdict, Verdict→Evidence, F→REQ | M09, M14, M16, M21, M26, M27 | REQ-015, REQ-023, REQ-024, REQ-033, REQ-052 |
-| **HashRecord** | M09 | for each artefact (document or ID block or increment): the upstream block hashes it was generated from, and its own hash at the last pipeline commit | M09 only (persisted in `.pipeline/hashes/`) | REQ-006, REQ-013, REQ-027 |
-| **StaleSet** | M09 | list of stale items, each with: item (doc / section / ID block / INC), granularity used, *cause* (upstream change, user-edit, restart, routing decision id) and the causal chain back to the root change | M10, M12, M14, M17, M27, M28 | REQ-007, REQ-027, REQ-033, REQ-038 |
-| **EditRecord** | M09 (detection), M03 (git evidence) | document, changed blocks, classification `user-edit` or `oq-answer`, commit/working-tree origin | M17, M15 | REQ-026, REQ-027, REQ-028 |
+### 3.5 Dual-language modules
 
-**Granularity contract (M09 → everyone):** a stale item is always reported at the finest granularity that exists: ID block, then section, then whole document. The `granularity` field tells consumers which one was used. M10's Preservation Guard and M27's cost estimate both depend on this.
-
-### 2.3 Run control
-
-| Structure | Owner | Key contents | Consumers | REQs |
-|---|---|---|---|---|
-| **RunState** (`state.json`) | M04 (storage), M12 (sole mutator via M04) | run id, branch, mode profile, controller state (§5), current/last completed unit, completed-unit list with commit refs, pending escalation, consent record, budget top-ups, checkpoint config snapshot | M12, M13, M14, M17 | REQ-005, REQ-006 |
-| **WorkUnit** | M12 | kind (`stage`, `increment`, `review`, `consistency`, `e2e`, `e2e-regression`, `critic-auto`, `rework-stage`, `rework-increment`), target id, mode (`normal` / `revise`), stale targets (revise only), originating routing decision id (rework only), ledger attribution tags | M10, M16, M19, M20, M21, M33 | REQ-006, REQ-016, REQ-038 |
-| **UnitOutcome** | each L3 executor | status (`committed`, `failed-verification`, `contract-violation`, `guard-violation`, `budget-stopped`, `error`), commit ref, emitted signals, cost | M12 | REQ-013, REQ-016, REQ-073 |
-| **Event** | M04 | timestamp, run id, type (state transition, unit start/end, budget warning, go-back, escalation, checkpoint, consent, user decision), payload | M13 (progress/verbose), M14, M15 | REQ-005, REQ-062 |
-| **Escalation** | M12 (raised), M14 (rendered), M29 (resolved) | reason (low confidence, cap reached, budget insufficient for rework, guard violation, contract violation, hand-edit policy, verification exhausted), problem summary, options with commands and the recommended option first, related routing decision id | M13, M14, M17, M29 | REQ-036, REQ-037, REQ-072 |
-| **RunLock** | M04 | PID, heartbeat time, run id | M12 (acquire), M13 (`start` refusal message) | REQ-009 |
-
-### 2.4 Cost
-
-| Structure | Owner | Key contents | Consumers | REQs |
-|---|---|---|---|---|
-| **LedgerEntry** | M05 | run id (or `critic-standalone`), stage, increment, go-back id, critic session id, model tier, tokens, cost, timestamp | M14, M27, M34, M35 | REQ-074 |
-| **Allowance** | M05 | per-call cap = min(stage share remaining, run remaining), or a refusal | M06 | REQ-072 |
-| **BudgetProjection** | M05 | spent, remaining, median-history estimate of remaining units, likely-to-finish flag | M13, M14 | REQ-075 |
-| **CostEstimate** | M05 (history query), M27 (rework), M34 (pre-run) | point estimate + basis (history / prior) | M14, M27, M29 | REQ-033, REQ-076 |
-
-### 2.5 Checks, verdicts and findings
-
-| Structure | Owner | Key contents | Consumers | REQs |
-|---|---|---|---|---|
-| **Finding** (common shape) | producers: M16 (consistency), M20 (review), M30/M31 (critic) | id `F-n`, source (`consistency`/`review`/`critic`), location, problem, severity, affected REQ/AD ids, evidence refs; critic-only fields: heuristic/guideline, suggestion, persona, interaction refs | M14, M25, M32 | REQ-015, REQ-018, REQ-046 |
-| **FindingState** | M32 | open / promoted / dismissed (+ reason), dismissal key = (target content hash, finding fingerprint) | M14, M30 (suppression) | REQ-047 |
-| **Scenario** | M21 | `E2E-n`, REQ id(s), preconditions, steps, expected observations derived from acceptance intent, driver kind, repeatable-spec ref | M22–M24, M08 | REQ-051 |
-| **ScenarioResult** | M21 (with driver data) | pass / fail / flaky / error, attempts, evidence refs | M21 judge, M25 | REQ-053, REQ-054 |
-| **Verdict** | M21 | per REQ: `pass` / `fail` / `not verifiable` + reason, scenario results used, judge rationale, evidence refs | M08, M14, M25, M35 | REQ-052 |
-| **EvidenceRef** | M21 (E2E), M31 (critic) | path under `.pipeline/evidence/<run>/…`, kind (step log, stdout, snapshot, screenshot, trace) | M08, M14, M26 | REQ-054, REQ-044 |
-| **SupportedTypeVerdict** | M11 (classification stage) | product type, support level (`full` / `partial` / `unsupported`), driver kind | M13, M21, M31 | REQ-014 |
-
-### 2.6 Feedback chain
-
-| Structure | Owner | Key contents | Consumers | REQs |
-|---|---|---|---|---|
-| **Signal** | M04 (queue storage); produced by M16, M19, M20, M21, M32, M29 (user report) | source kind, source ref (finding id / scenario / INC), REQ ids, raw evidence refs, produced-at unit | M25 (consumer); M14 (pre-M25 display) | REQ-034 |
-| **Issue** | M25 | stable issue key (normalised symptom + REQ ids + location class), signals merged, attempt count, history of routing decision ids, status (`open`/`routed`/`resolved`/`known-issue`/`flaky`) | M26, M27, M28, M19 (attempt counting) | REQ-034, REQ-035, REQ-037, REQ-053 |
-| **EvidenceBundle** | M26 | trace chain around the issue (REQ→AD→T→INC→E2E→verdict), linked document excerpts, diff scope of the INC, evidence refs | M26 attributor, M28 (links in decision) | REQ-030 |
-| **Attribution** | M26 | ranked candidate stages each with rationale; rule hits; LLM ranking; confidence bucket + one-line reason | M27 | REQ-031, REQ-032 |
-| **RoutingPlan** | M27 | chosen target stage, nearest-first position, alternatives, impact (StaleSet), CostEstimate vs remaining budget, gate result `auto-proceed` / `ask-user` / `escalate` with reason | M28, M29, M12 | REQ-033, REQ-035, REQ-036, REQ-037, REQ-072 |
-| **RoutingDecision** | M28 | the published, user-readable record: symptom, origin, REQ ids, evidence links, confidence + reason, alternatives, impact, cost vs remaining, author (`router` / `user`), outcome (`pending`/`resolved`/`recurred`/`rejected`/`overridden`) | M12, M14, M15, M29 | REQ-030, REQ-041 |
+M09 (read-model access), M10 (suppression lookups) and M28 (not dual) need care:
+- **M09:** writes are Python only (R3). Reads of read models happen in TS, but only inside M10 (`IF-10a`), per rule 2.
+- **M10:** policy evaluation is TS (R1/R2). The suppression **lookup** is also needed in Python for ingestion (M18, M20, M21, M22), so M10 ships a thin Python read-only client for `IF-10c SuppressionCheck`. Suppression **writes** are TS only (from M11 outcomes).
+- LLD must keep a single source of truth for identifier normalisation (for domain, email, phone and company ID hashing) that both clients share. **[assumption]** This is a spec with shared test vectors, not shared code.
 
 ---
 
-## 3. Durable stores and ownership
+## 4. Data ownership map
 
-| Store | Writer (only) | Readers | Kind |
-|---|---|---|---|
-| `docs/<stage>.md` | the stage's L3 module via M10 (content) → M03 (commit) | L2, L3, L4 | authored, git |
-| `docs/review.md` | M20 via M10 | M08, M14, M25 | authored, git |
-| `docs/e2e.md` (scenarios + verdicts view) | M21 | M08, M14, M26 | authored, git |
-| `docs/routing.md` | M28 | user, M14 | rendered, git |
-| `docs/decisions.md` | M15 | user, M14 | rendered, git |
-| `docs/run_report.md` | M14 | user | rendered, git |
-| `docs/critic/<ts>.md` | M30/M31 | user, M32 | authored, uncommitted until next pipeline commit |
-| `src/`, tests | M19 (agent via M06 code-write) | M20, M21 judge, M18 | code, git |
-| `.pipeline/state.json`, `lock`, `events.jsonl`, `signals.jsonl` | M04 (M12 is the sole caller for state) | M12, M13, M14, M15, M25 | operational |
-| `.pipeline/ledger.jsonl` | M05 | M13, M14, M27, M34 | append-only |
-| `.pipeline/routing.jsonl` | M28 (router decisions), M29 (user decisions) | M14, M15, M26 (calibration) | append-only, cross-run |
-| `.pipeline/findings.jsonl` | M32 | M14, M30, M25 | append-only (state as latest record) |
-| `.pipeline/trace.json` | M08 | M09, M14, M16, M26, M27 | derived cache, rebuildable |
-| `.pipeline/hashes/` | M09 | M09 | derived-at-commit |
-| `.pipeline/evidence/`, `.pipeline/logs/` | M21/M22–M24/M31 (evidence), M06 (logs) | M14, M26, M13 verbose | gitignored |
-
-**Safe-point write order (M12 orchestrates, AD-3):** unit output on disk → M03 commit (with trailers) → M09 records hashes → M08 rebuilds the trace → M04 updates `state.json` and appends the event. If there is a crash between the commit and the state update, M04's reconciliation reads M03 trailers on resume. Hashes and trace are recomputed because they are derived.
-
----
-
-## 4. Module interfaces
-
-Each interface is listed with its provider, main consumers, the operations it offers (coarse), and the REQs it carries. The operation names are descriptive, not API names.
-
-### 4.1 Infrastructure (L1)
-
-**I-CFG: Policy access (M01)**
-- Provides: resolved Policy (config file merged with CLI flags), with per-key provenance for the report.
-- Consumers: all modules.
-- REQs: REQ-003, REQ-027, REQ-037, REQ-049, REQ-070, REQ-071.
-
-**I-VCS: Version control (M03)**
-- Ensure the run branch exists and is checked out; commit a unit (paths, message, trailers `Pipeline-Run`, `Stage`, `Refs`, `Routing-Decision`); find the commit for a unit; diff for a unit; list non-pipeline changes since a commit (commits without pipeline trailers + working-tree changes); read file content at a revision (for ID-reuse checks and critic snapshots); revert a unit (user verb).
-- Consumers: M09 (edit detection), M10, M16 (ID history), M19, M28, M30 (HEAD snapshot), M04 (trailer reconciliation), M17.
-- REQs: REQ-017, REQ-026, REQ-038, REQ-063, REQ-020 (history check).
-
-**I-STATE: Run state, events, lock, signals (M04)**
-- Lock: acquire / heartbeat / release / inspect (with dead-PID recovery).
-- State: read snapshot / atomic replace (M12 only) / reconcile from VCS trailers.
-- Events: append / tail / query by run.
-- Signals: append (any producer) / read unconsumed / mark consumed (M25 only).
-- Consumers: M12 (all), M13 (tail, inspect lock), M14/M15 (query), M16/M19/M20/M21/M29/M32 (append signals), M25 (consume).
-- REQs: REQ-005, REQ-006, REQ-009, REQ-034, REQ-062.
-
-**I-LEDGER: Budget and cost (M05)**
-- Request an Allowance for a call (tags: run, stage, increment, go-back, critic); record usage; totals by tag; BudgetProjection; historical cost for a stage kind (median, count); top up the budget (resume); per-scope caps (run, stage share, standalone critic).
-- Emits (through I-STATE events plus an in-process notification to M12): warning threshold crossed, budget exhausted.
-- Consumers: M06 (allowance and usage), M12, M13, M14, M27, M30, M34, M35.
-- REQs: REQ-070–REQ-075, REQ-033.
-
-**I-AGENT: Agent invocation (M06)**
-- Run one agent unit: role tier, permission profile, system/role template, context documents, tool allow-list, attribution tags, optional structured-output expectation. Returns final text/artefacts, usage and a transcript ref. It fails fast with `budget-refused` if the allowance is refused.
-- Guarantees: fresh session per unit (an in-unit retry may continue its session); every call passes through I-LEDGER; permissions are enforced by callbacks/hooks, not just by prompt; shell tool use is denied unless an I-SANDBOX executor is registered.
-- Consumers: M10, M16 (LLM layer), M19, M20, M21 (deriver, judge, web exploration), M26, M30, M31, M34 (classifier), M35.
-- REQs: REQ-056, REQ-062, REQ-070, REQ-072, REQ-074, REQ-081.
-
-**I-SANDBOX: Isolated execution (M18)**
-- Ensure consent for this run (renders a consent block through M13; the result is recorded in RunState via M12/M04); exec a command (cwd, env allow-list, time/CPU/memory limits, network phase `install` or `run`) → exit code, stdout, stderr, artefact paths; start the app (entry point from the implementation doc) → handle, reachable localhost endpoint; stop the app; register as M06's shell executor; report the mode (`container` / `local-restricted`) for M14.
-- Consumers: M19, M21–M24, M31, M35, M06 (hook).
-- REQs: REQ-016, REQ-044, REQ-050, REQ-056.
-
-### 4.2 Knowledge (L2)
-
-**I-DOC: Document model (M02)**
-- Parse a document → StageDocument; list ID blocks and references; hash a block/section/document; validate against a contract profile (the base contract plus stage-specific rules, e.g. "REQ blocks carry acceptance intent", "AD blocks carry status + REQs"); extract open questions.
-- Consumers: M08, M09, M10, M14, M15, M16, M17, M21, M26, M30.
-- REQs: REQ-004, REQ-011, REQ-012, REQ-020–REQ-023.
-
-**I-REGISTRY: Stage registry (M07)**
-- Look up a manifest by id; list the stages of a mode profile in order; upstream/downstream stages of a stage; checkpoint candidates; hooks after a stage.
-- Consumers: M09, M10, M12, M17, M33, M34.
-- REQs: REQ-008, REQ-010, REQ-013, REQ-071.
-
-**I-TRACE: Trace graph (M08)**
-- Rebuild (full or for one changed doc); coverage query (Must REQs lacking a task / INC / scenario / verdict); orphan query; unknown-reference query; downstream closure of a node set; upstream chain for a node (used by the router); coverage matrix rows for the report.
-- Consumers: M09, M14, M16, M21, M26, M27.
-- REQs: REQ-015, REQ-023, REQ-024, REQ-033, REQ-052.
-
-**I-STALE: Staleness (M09)**
-- Record the generation basis for an artefact at commit; compute the current StaleSet (full scan, or "what if these blocks change" for M27 impact previews without mutating anything); detect edits → EditRecords; mark items stale by fiat (restart, routing decision) with a cause; check the preconditions of a stage (inputs exist and are not stale).
-- Consumers: M10 (preconditions, recording), M12 (next unit), M14, M17, M27 (preview), M28 (mark).
-- REQs: REQ-006, REQ-007, REQ-013, REQ-026, REQ-027, REQ-028, REQ-033, REQ-038.
-
-**I-REPORT: Rendering (M14)**
-- Render the run report (at every stop), the status view, escalation blocks and routing-decision summaries. Sections are **section providers** registered by later modules: coverage and verdicts (M21), go-backs (M28), open findings (M32), consistency/review findings (M16/M20, before M25). A missing provider renders `n/a`.
-- Consumers: M12 (trigger on stop), M13 (status, escalation display), M29.
-- REQs: REQ-005, REQ-024, REQ-060, REQ-061, REQ-074.
-
-**I-DECISIONS: Decision log (M15)**
-- Record a decision (by stage, router or user; what, why, supersedes); re-render `docs/decisions.md` from events; maintain AD supersession consistency.
-- Consumers: M10 (stage-declared decisions), M17 (user edits), M28, M29.
-- REQs: REQ-022, REQ-025.
-
-### 4.3 Work (L3)
-
-All L3 executors share one shape: **execute(WorkUnit) → UnitOutcome**. They are called only by M12, except M30/M31, which are called by the critic entry point. Each may append Signals and must not commit except through M10/M03.
-
-**I-STAGE: Stage runner (M10)**
-- Execute a document-stage WorkUnit in `normal` or `revise` mode. Internally: I-STALE precondition check → context assembly (upstream docs, answered open questions; in revise mode also the routing decision, stale IDs and the current doc) → I-AGENT → I-DOC validation (one re-prompt) → Preservation Guard (revise mode: every non-stale block hash unchanged; one re-prompt) → I-VCS commit → I-STALE record → I-TRACE rebuild.
-- Outcome on a failed validation or a guard violation after the re-prompt: `contract-violation` / `guard-violation`, which M12 turns into an Escalation.
-- Used by: M11 (document stages), M19 (implementer stage definition shares context assembly), M20, M21 (e2e.md), M34 (brief stage).
-- REQs: REQ-002, REQ-004, REQ-011–REQ-013, REQ-026, REQ-038.
-
-**I-STAGEDEF: Stage definitions (M11, M19, M20, M21, M34)**
-- Each provides manifests plus role templates, registered into M07. Stage-specific contract rules are supplied to M02's validator as a contract profile. The classification definition (M11) must produce the SupportedTypeVerdict in a machine-readable block.
-- REQs: REQ-010, REQ-012, REQ-014, REQ-020–REQ-023.
-
-**I-CONSIST: Consistency check (M16)**
-- Execute the `consistency` unit after a planning stage: deterministic checks via I-TRACE + I-VCS history, then an LLM contradiction scan via I-AGENT (read-only). Output: Findings plus a Signal for each finding that needs action. Never writes documents other than its own findings section in the report data.
-- REQs: REQ-015, REQ-020, REQ-023, REQ-034.
-
-**I-INCREMENT: Increment executor (M19)**
-- Execute one `increment` / `rework-increment` unit: implementer agent (code-write) → Verification Gate via I-SANDBOX (build + the increment's own tests) → commit with `Refs: REQ-…, T-…, INC-…`. On failure: bounded local retry, then a Signal (source `verification`) and `failed-verification` outcome.
-- Attempt counting: uses the Issue attempt count from M25 when present; before M25 it keys on INC id and applies the M01 cap directly.
-- REQs: REQ-016, REQ-017, REQ-023, REQ-037, REQ-056.
-
-**I-REVIEW: Reviewer (M20)**
-- Execute the `review` unit read-only; writes `docs/review.md` (through M10) and Signals for findings above a severity threshold (threshold is policy, see open question 5).
-- REQs: REQ-018, REQ-034.
-
-**I-E2E: E2E harness (M21) and I-DRIVER plug-ins (M22, M23, M24)**
-- M21 executes `e2e` and `e2e-regression` units: derive scenarios (context limited to REQs, acceptance intent, SupportedTypeVerdict and public entry points; **no source access**, enforced by the permission profile and context assembly) → select a driver by driver kind → run → flake filter (re-run failures N times in fresh app instances) → Requirement Judge per REQ (read-only code access for omission checks only) → Verdicts + evidence → Signals for non-flaky failures and for Must REQs judged `fail`.
-- Regression unit input: previously failing scenarios, previously passing scenarios of affected REQs (from the StaleSet), and a smoke subset.
-- **I-DRIVER** (implemented by M22 CLI, M23 web, M24 lib/API; consumed by M21 and M31): declare supported driver kind; prepare (via I-SANDBOX: start app or ready the CLI); run a scenario (or free exploration for the critic) → step log, observations, evidence refs; replay a repeatable spec (M23: generated Playwright spec); teardown. Unsupported types have no driver, and M21 emits `not verifiable: unsupported type` directly.
-- REQs: REQ-014, REQ-039, REQ-050–REQ-055.
-
-**I-CRITIC: Critic (M30, M31) and I-FINDINGS (M32)**
-- M30: critique(target = doc | doc set | app, persona?, flow?) → a critic report with Findings, a banner and a reliability note. It takes the snapshot at HEAD through I-VCS, charges I-LEDGER with the run tags if a run is active (lock inspected via I-STATE), otherwise with the standalone critic cap. It filters out dismissed findings using I-FINDINGS suppression keys.
-- M31: app-mode extension; uses I-SANDBOX and I-DRIVER exploration. **Coverage gate:** the report is accepted only if the recorded interactions cover the requested flow, and every finding cites interaction refs.
-- M32 (I-FINDINGS): record findings; promote (→ Signal with source `critic` via I-STATE); dismiss with a reason (stores the suppression key); list open findings (report section provider).
-- REQs: REQ-042–REQ-048 (M30/M31), REQ-034, REQ-047 (M32).
-
-### 4.4 Control (L4)
-
-**I-RUN: Run controller (M12)**
-- Verbs it serves (called by M13/M17/M29): start(idea, mode, budget), resume(top-up?), stop-requested, apply-user-decision(escalation option | checkpoint approve/reject | route override).
-- Internal loop: choose the next WorkUnit → dispatch to L3 → handle the UnitOutcome → safe point (§3) → run the stage hooks → drain signals into the router (Phase 4+) → check the budget notification → transition state.
-- **Next-unit rule** (deterministic, re-derivable from files): (1) pending rework units from accepted RoutingDecisions, in stage-dependency order; (2) otherwise the first stale or missing unit of the mode profile, in profile order (M09 StaleSet ∩ M07 profile); (3) otherwise, if unconsumed signals exist, route them; (4) otherwise `done`.
-- REQs: REQ-002, REQ-006, REQ-009, REQ-010, REQ-013, REQ-073.
-
-**I-HUMAN: Human control (M17)**
-- Checkpoint handling: after a checkpoint-capable stage listed in Policy, M12 transitions to `checkpoint`; M17's `approve` resumes, and `reject` stops (the run stays resumable).
-- Restart from a stage: I-STALE mark-by-fiat on the stage and everything downstream, cause `restart`.
-- Resume-time edit flow: I-STALE edit detection → present the StaleSet with causes → confirm (attended) or apply policy (unattended; the default raises an `Escalation(reason = hand-edit policy)`) → I-DECISIONS "user edit".
-- REQs: REQ-003, REQ-007, REQ-026–REQ-028, REQ-061.
-
-**I-ROUTER: Router chain (M25 → M26 → M27 → M28, with M29)**
-- M25 intake: consume Signals → merge into Issues by issue key → drop flaky items (record only) → produce the "issues ready to route" list.
-- M26 attribute(Issue) → EvidenceBundle + Attribution. The rules layer is deterministic over I-TRACE; the LLM layer runs via I-AGENT (strong tier, read-only, documents + evidence, no transcripts). Calibration input: past outcomes from `routing.jsonl`.
-- M27 plan(Issue, Attribution) → RoutingPlan. Nearest-first over the stage order in I-REGISTRY; on recurrence (the Issue already has a resolved-then-recurred decision) the minimum distance steps back by one stage. Impact via I-STALE preview; cost via I-LEDGER history × stale fraction + regression cost; the gate applies REQ-036 policy, the caps from Policy, and a budget sufficiency check.
-- M28 enact(RoutingPlan) → RoutingDecision published (`docs/routing.md`, `routing.jsonl`, I-DECISIONS). If `auto-proceed` (or user-accepted), it marks the stale set with cause = decision id via I-STALE and hands M12 the rework WorkUnits in dependency order ending with an `e2e-regression` unit. After regression it sets the outcome: failing items fixed and no regression → `resolved`; same issue key fails again → `recurred` (the Issue re-enters M27).
-- M29 overrides: redirect (user-authored plan re-entering the M27 gate with target fixed; caps and budget still apply), reject as known issue (Issue → `known-issue`, outcome `rejected`), manual go-back (creates a Signal of source `user` with a target hint that M27 honours), and escalation option selection. All are logged as user-authored.
-- REQs: REQ-030–REQ-041, REQ-053, REQ-072.
-
-### 4.5 Interface (L5)
-
-**I-CLI (M13 core; verbs added by M17, M29, M30, M32, M34, M35)**
-- Verb → call on I-RUN / I-HUMAN / I-ROUTER (M29) / I-CRITIC / I-FINDINGS / baseline. The progress renderer is a subscriber to I-STATE events (one line per unit event; verbose tails M06 logs). The escalation and consent prompts are rendered by M14/M18 content and displayed by M13.
-- Verb-name collision to resolve in low-level design: M17's checkpoint `reject` and M29's "reject go-back as known issue" (see open question 1).
-- REQs: REQ-001, REQ-005, REQ-006, REQ-014, REQ-062, REQ-070, REQ-074, REQ-075.
+| Data (conceptual) | Owner | Schema | Written by | Read by |
+|---|---|---|---|---|
+| Accounts, members, sessions, admin roles | M05 / M07 | serving | M05, M07 | all serving modules via `DS-01` |
+| Business profile, workspaces, workspace defaults | M07 | serving | M07, M13 (HS code), M16 (country shortlist), M40 | M13, M16, M26, M33, M34, M38 |
+| Consent ledger, notice versions | M06 | serving | M06 | M38, M50 |
+| Source licence register | M08 | knowledge | M08 (operator config) | M09 (flag inheritance), M10 (licence rules), M35 |
+| Raw landing objects | M08 | S3 | connectors (M12, M14, M17, M20, M21, M23, M53) | same connectors (reprocessing) |
+| Companies, assertions, negative assertions | M09 | knowledge | **only via `IF-09a`** (M18–M25, M17 flags, M53; serving-originated commands via `IF-09b`) | M10, M15, M24, M25, projection builder |
+| Buyer read models (profile doc, search doc) | M09 | knowledge | M09 projection builder | **M10 only** (on behalf of M26, M27, M29, M34, M35, M41, M45, M48) |
+| Global suppression list | M10 | knowledge **[assumption]** | M10 (triggered by M11 outcomes) | M10 (TS), M18/M20/M21/M22 (Python client) |
+| Per-user hides | M30 | serving | M30 | M10 (as a registered provider) |
+| Review items, outcomes, audit trail | M11 | serving | M11 (items filed by M17, M18, M30, M31, M36, M43, M47) | M11 |
+| HS nomenclature, correlations, ITC-HS policy, embeddings | M12 | knowledge | M12 | M13, M14, M37, M40 |
+| Market stats, rankings, FTA table, "why" summaries | M14 | analytics (read model in knowledge) | M14 | M16 via `IF-14a` |
+| Coverage matrix | M15 | knowledge | M15 | M16, M26 via `IF-15a` |
+| Sanctions lists, screening results, `sanctions_block` flags | M17 | knowledge | M17 (+ M11 outcome via `IF-09b`) | M10, M24 |
+| Shipment raw/parquet | M21 | S3 / analytics | M21 | M21 only (aggregates go to M09) |
+| Trust results (per entity, rule-versioned) | M24 | knowledge | M24 | projection builder (M09) |
+| Ledger entries, holds, balances | M28 | ledger | **only via `IF-28a`** | M28 (balance/history), M41, M39 |
+| Price catalogue, plan allowances | M28 (catalogue), M36 (plans) | config + serving | operator / M36 | M04 cost badge, M29, M32, M35, M37 |
+| Revealed-contact records | M29 | serving | M29 | M35, M34 (contact availability), M38 |
+| Check-a-buyer results | M32 | serving | M32 | M32, M38 |
+| Shortlist entries, statuses, notes | M33 | serving | M33 | M34, M35, M41, M44, M38 |
+| Drafts, thread context | M34 | serving | M34, M42 | M42, M38 |
+| Export jobs and files | M35 | serving + S3 | M35 | M35 (download), M38 |
+| Subscriptions, payments, invoices, entitlements | M36 | serving + S3 (PDFs) | M36 (webhooks only for entitlement changes) | M10 (entitlement provider), M28 (grants), M43 |
+| Content / Learn / promise pages | M37 | repo/CMS | operator | M04, M13, M24 (wording), M32, M34 (guidance) |
+| Reminders, notifications, dashboard read model | M41 | serving | M41 | M41 |
+| Outcome events | M44 | analytics | M44 | analytics |
+| Saved searches, alert hits | M45 | serving | M45 | M41 |
 
 ---
 
-## 5. Run Controller state machine (M12)
+## 5. Key data structures (conceptual)
 
+### DS-01 ActorContext — owner M01 (populated by M05, M07, M36)
+Who is acting and with what rights. It is passed through every serving call.
+- actor kind: anonymous visitor / user / admin / system job
+- account id, member id, current workspace id (if any)
+- plan and entitlements snapshot (from M36; default Free until M36 exists, from M28 allowance config)
+- locale, region (for gating)
+- anonymous session id and rate-limit bucket (M05)
+*(REQ-004, REQ-008, REQ-051, REQ-063)*
+
+### DS-02 SourceRegisterEntry — owner M08
+- source id, source type (customs / website / directory / registry / sanctions / market-stats / nomenclature / user report / operator)
+- licence flags: can_store, can_display, can_export, retention_days, attribution_text
+- personal_data_class ceiling, allowed_regions
+- status (active / disabled / prohibited). LinkedIn-class sources exist only as `prohibited` so the prohibition is explicit.
+*(REQ-036, REQ-033, REQ-048)*
+
+### DS-03 Company (canonical entity) — owner M09
+- stable company id; lifecycle (active / merged-into / closed)
+- anchors: registry ids, LEI, VAT, primary domain (all as assertions, with anchors indexed)
+- merge lineage (so reports and pipeline rows that point to merged ids keep resolving)
+
+### DS-04 Assertion — owner M09
+The single representation of every buyer and contact fact.
+- subject (company id; later person id for `named_person`), attribute (from a controlled vocabulary per module: product-evidence, buyer-type, activity-aggregate, contact-*, registry-*, domain-*, logistics-flag, sanctions-flag, trust-check-*…), value (structured)
+- polarity (positive / negative, e.g. "email invalid")
+- source id → DS-02, source type, source reference (URL + capture date, shipment batch id, registry record id, report id)
+- observed_at, checked_at, confidence
+- inherited licence flags, personal_data_class, region
+- producer module id and producer version (for audit and reprocessing)
+*(REQ-017, REQ-024, REQ-033, REQ-036)*
+
+**Rule (M09, M20):** an assertion produced with LLM help must carry a source reference to the captured page. `IF-09a` rejects LLM-derived assertions that have no page reference. *(REQ-017, REQ-024)*
+
+### DS-05 Buyer read models — owner M09 (shape agreed with M26/M27)
+- **SearchDoc** (one per company × HS heading with evidence): name, city/country, buyer type + confidence, evidence summary + strongest source type, latest activity, trust level, contact types available, shipment frequency/volume (if any), India/competitor origin flags (if any), logistics flag, text fields for keyword search, plus ids of the underlying assertions (so M10 can apply per-fact licence and suppression rules).
+- **ProfileDoc** (one per company): overview, evidence list (source type, what it says, last seen/checked), activity summary, sourcing (REQ-022), website, trust checklist (DS-08), contact slots (type, source, checked_at, deliverability status, **with values held back**; values are released only through M29).
+- Both carry a projection version and `built_at`. They are rebuilt from `EV-01`.
+*(REQ-016, REQ-017, REQ-021, REQ-022, REQ-024, REQ-027, REQ-032, REQ-033)*
+
+### DS-06 SuppressionEntry — owner M10
+- normalised and hashed identifier (kind: domain / email / phone / company id / registry id)
+- scope (global; **[assumption]** there is no partial scope in the MVP), reason (removal request / confirmed invalid / operator), review item id, created_at
+*(REQ-037)*
+
+### DS-07 PolicyDecision — owner M10
+Returned for each document or entity by `IF-10a`:
+- visibility: hidden / visible / visible-with-warning (sanctions)
+- allowed actions: {view, reveal, draft, export, notify}
+- field redactions (licence display/export, region/personal-data gating)
+- reason codes (for UI explanation and audit, e.g. `SANCTIONS_BLOCK`, `USER_HIDDEN`, `PLAN_LIMIT`, `LOGISTICS_DEFAULT_HIDDEN`)
+- plan limit metadata (for example "20 of 143 shown on Free")
+*(REQ-020, REQ-025, REQ-029, REQ-036, REQ-037, REQ-048, REQ-051)*
+
+### DS-08 TrustResult — owner M24
+- subject (company id, or an ad-hoc input hash for M32)
+- checks: list of {check id, outcome pass/fail/unknown, checked_at, supporting assertion ref, explanation key}
+- rollup level High/Medium/Low/Unknown, rule-set version, wording-copy version (M37)
+- red flags (M32 rules engine output, when there are any)
+*(REQ-027, REQ-028, REQ-030, REQ-031)*
+
+### DS-09 CoverageCell — owner M15
+- country, HS heading (or a country-level fallback row)
+- source types present, company counts, freshness stats
+- label Strong/Partial/Limited, explanation template key + parameters, rule version, computed_at
+*(REQ-012)*
+
+### DS-10 MarketRow — owner M14
+- country × HS6: import value, growth, India share, top supplier countries, FTA flag + agreement ref, "why" summary (cached LLM text + input snapshot hash), data year/version
+*(REQ-010, REQ-011, REQ-013)*
+
+### DS-11 HsCode — owner M12
+- code, level (chapter/heading/subheading/ITC-HS 8-digit), nomenclature version, descriptions, parent
+- ITC-HS export policy status + official source link (8-digit only)
+- correlation links across versions
+*(REQ-005, REQ-006, REQ-007, REQ-009)*
+
+### DS-12 LedgerEntry / Hold — owner M28
+- account id, entry type (grant / top-up / hold / commit / release / debit / refund / expiry / adjustment), credits (signed, double-entry pair), action type + action reference (reveal id, check id, export id), price-catalogue version, idempotency key, `refers_to` (a refund or commit points to its hold or debit), created_at
+- A hold has a TTL. An expired hold releases itself.
+*(REQ-034, REQ-054, REQ-056)*
+
+### DS-13 PriceCatalogue — owner M28
+- action → credits, optional country multipliers, catalogue version, effective dates. It is the **single source** for the M04 cost badge, the M37 public pages and M28 debits.
+*(REQ-054, REQ-066)*
+
+### DS-14 ReviewItem — owner M11
+- item type (registered by the owning module), subject refs, payload, filed_by (user / system / public requester), SLA timestamps, state, outcome, outcome handler result, audit trail
+*(REQ-064)*
+
+### DS-15 ShortlistEntry — owner M33
+- workspace id, company id (following merges), status, status history, notes, next-action reminder ref (M41), created_at
+*(REQ-045, REQ-046, REQ-047)*
+
+### DS-16 Draft — owner M34
+- workspace id, shortlist entry id, kind (first / follow-up n / WhatsApp intro), language, tone, generated body, **code-assembled footer** (sender identity, business details, opt-out line, EU/UK source-disclosure), user edits, model id, created_at, left-product-at (copy/mailto clicked)
+*(REQ-038, REQ-039, REQ-040, REQ-041)*
+
+### DS-17 RevealRecord — owner M29
+- account id, company id, contact assertion ids revealed with the values *as shown*, deliverability status at reveal time, ledger hold/commit refs, revealed_at
+- It is the basis for export eligibility (M35) and for automatic refunds (M30).
+*(REQ-034, REQ-048)*
+
+### DS-18 JobEnvelope / DomainEvent — owner M02
+- type, payload version, idempotency key, correlation id (links a user action to all its downstream jobs, for cost and audit), actor ref, attempt metadata
+
+---
+
+## 6. Domain events
+
+All events use `IF-02c` (outbox → jobs). Consumers must be idempotent.
+
+| Event | Producer | Consumers | Purpose | REQs |
+|---|---|---|---|---|
+| **EV-01 EntityChanged** (company id, changed attribute classes) | M09 | M09 projection builder, M24 (if trust inputs changed), M17 (new name/anchor), M22 (new domain), M15 (batched mark-dirty), M45 (later), M48 (later) | Keep read models, trust and coverage in sync | REQ-012, REQ-016, REQ-027 |
+| **EV-02 SanctionsListUpdated** | M17 | M17 (full re-screen job) | Re-screen every entity after a list changes | REQ-029 |
+| **EV-03 SanctionsFlagChanged** | M17 (and M11 outcome) | M09 projection builder, M10 cache invalidation | Block or unblock across all surfaces | REQ-029 |
+| **EV-04 SuppressionAdded** | M10 | M09 (purge read models for matching entities), M26 search doc removal, M35 (cancel pending exports that contain them) | No window in which suppressed data is visible | REQ-037 |
+| **EV-05 DiscoveryCompleted** (country × HS, new company count) | M20 | M15 (recompute cell), M26 (live results update), M41 (notify requester, once M41 exists) | Cold-search completion | REQ-015, REQ-026 |
+| **EV-06 ContactVerified / ContactInvalidated** (assertion id, outcome, trigger ref) | M25 | M30 (refund decision), M09 (negative assertion already written), M29 (awaiting reveal) | Automatic refund path | REQ-033, REQ-034 |
+| **EV-07 ReviewOutcome** (item type, outcome) | M11 | handler of the module that registered the item type (M17, M18, M30, M31, M36, M43, M47) | Close loops through the owners' write paths | REQ-064 |
+| **EV-08 PipelineStatusChanged** | M33 | M44 (outcome events), M41 (dashboard), M42 (follow-up timing) | Metrics and reminders | REQ-046, REQ-050 |
+| **EV-09 DraftLeftProduct** (copy/mailto/wa.me) | M34 | M33 (auto-set status to Contacted), M41 | Flow 1 step 8 | REQ-040, REQ-046 |
+| **EV-10 PaymentVerified / SubscriptionChanged** | M36 (webhook handler, after signature and idempotency checks) | M28 (grants, top-ups), M10 entitlement cache, M41 | Entitlements come only from verified payments | REQ-052, REQ-053 |
+| **EV-11 ConsentWithdrawn / DataRightsRequested** | M06 / M38 | every registered data-rights contributor (see `IF-38a`) | Rights actions across all schemas | REQ-061 |
+| **EV-12 NomenclatureVersionLoaded** | M12 | M40 (flag workspaces), M14 (re-key stats) | HS 2027 handling | REQ-009 |
+| **EV-13 ReportFiled** | M30 | M25 (re-verify contact), M11 (content reports) | Report flow | REQ-025 |
+
+---
+
+## 7. Interface catalogue
+
+"Style": **lib** = in-process call inside the same runtime · **rpc** = internal synchronous call across runtimes (§3.4 only) · **job** = enqueue through M02 · **event** = subscribe through `IF-02c` · **read** = read-model query · **http** = public or external HTTP endpoint.
+
+### 7.1 Platform (Phase 0)
+
+| IF | Owner | Users | Style | Purpose | REQs |
+|---|---|---|---|---|---|
+| IF-01a ScopedDataAccess | M01 | all serving modules | lib | Runs queries under DS-01 with tenant predicates | REQ-008, REQ-063 |
+| IF-01b CostMeter | M01 | M03, M08 connectors, M20–M23, M25, M36 | lib | Records vendor spend per job, account and credit | enabling (REQ-052/054 pricing from data) |
+| IF-01c Observability | M01 | all | lib | Logs and traces carrying a correlation id | — |
+| IF-02a JobQueue | M02 | all async producers | lib (TS + Py) | Typed, idempotent jobs with rate-limit classes | enabling REQ-026, 034, 047, 061 |
+| IF-02b Schedule | M02 | M14, M15, M17, M20, M21, M25, M36, M41, M45 | lib | Cron registrations | enabling |
+| IF-02c EventBus (outbox) | M02 | all producers and consumers in §6 | event | Transactional events | enabling |
+| IF-03a LlmComplete / LlmStream | M03 | M13, M14, M19, M20, M34, M42, M49 | lib (TS + Py) | Tiered model call, cache key, personal-data-free logging, cost via IF-01b | REQ-005, REQ-013, REQ-038, REQ-015/016/024 |
+| IF-04a UI kit incl. CostBadge, TrustChecklist, CoverageLabel, Disclaimer | M04 | all page modules | lib | Consistent wording and cost display; CostBadge takes its price from IF-28c | REQ-054, REQ-057, REQ-058, REQ-012, REQ-028 |
+
+### 7.2 Accounts (Phase 1)
+
+| IF | Owner | Users | Style | Purpose | REQs |
+|---|---|---|---|---|---|
+| IF-05a OtpAuth | M05 | M04 pages | http | Request and verify OTP (SMS via DLT provider, email via ESP); create session | REQ-001 |
+| IF-05b SessionResolve | M05 | R1 middleware | lib | Builds DS-01 from a user or anonymous session; admin MFA state | REQ-001, REQ-004 |
+| IF-05c AnonymousGuard | M05 | M13, M16, M26 (preview), M31, M32 | lib | Per-IP/device rate limits and bot challenge for anonymous or public use | REQ-004, REQ-051 |
+| IF-06a Consent | M06 | M05 signup, M38, M50 | lib | Record or withdraw consent against a notice version; query current consent | REQ-062, REQ-061 |
+| IF-07a Workspace | M07 | M13, M16, M26, M33, M34, M40 | lib | CRUD on workspaces; get/set HS code (with version) and country shortlist defaults | REQ-008, REQ-014 |
+| IF-07b BusinessProfile | M07 | M34, M42, M47, M49 | lib | Read the sender identity and business details used in drafts and footers | REQ-002, REQ-039 |
+
+### 7.3 Knowledge core and governance (Phase 2)
+
+| IF | Owner | Users | Style | Purpose | REQs |
+|---|---|---|---|---|---|
+| IF-08a SourceRegistry | M08 | M09, M10, M35, all connectors | lib (Py; TS read-only) | Look up DS-02; a connector refuses to start with no active entry | REQ-036, REQ-048 |
+| IF-08b ConnectorBase + RawLanding | M08 | M12, M14, M17, M20, M21, M23, M53 | lib (Py) | Fetch → immutable dated S3 object → parse hook; retention lifecycle | REQ-036 |
+| IF-09a AssertionWrite | M09 | M17, M18, M19, M20, M21, M22, M23, M24, M25, M53 | lib (Py) | Upsert/negate assertions with provenance; inherits licence flags; checks suppression through IF-10c; emits EV-01 | REQ-017, REQ-024, REQ-033, REQ-036, REQ-037 |
+| IF-09b AssertionCommand | M09 | M11 outcome handlers, M30, M31 (corrections) | job | Serving-originated facts (user reports, operator corrections, confirmed merges, sanctions decisions) queued to R3 and applied through IF-09a | REQ-025, REQ-037, REQ-064 |
+| IF-09c EntityQuery | M09 | M15, M17, M18, M22, M24, M25 | lib (Py) | Read assertions by subject, attribute, staleness or anchor | — |
+| IF-09d ReadModelStore | M09 | **M10 only** | read | Fetch SearchDoc/ProfileDoc sets and run the search query primitives defined with M26 | REQ-016, REQ-021 |
+| IF-10a PolicyGate | M10 | M26, M27, M29, M32 (catalogue match), M34, M35, M41, M45, M48 | lib (TS) | Given DS-01 + surface + a query or ids → policy-filtered docs + DS-07 per doc. Rules run in the architecture order (§3.8). | REQ-020, REQ-025, REQ-029, REQ-036, REQ-037, REQ-048, REQ-051 |
+| IF-10b PolicyProviders (registration) | M10 | M17 (sanctions flag), M19 (logistics flag, via read-model field), M30 (user hides), M28/M36 (entitlements) | lib | Lets higher modules plug in rule inputs without M10 depending on them. Stubs return "no restriction" / Free defaults until the provider exists. | REQ-020, REQ-025, REQ-029, REQ-051 |
+| IF-10c SuppressionCheck | M10 | M18, M20, M21, M22 (Py client); M10 itself | lib | Is this identifier suppressed? | REQ-037 |
+| IF-10d Suppress | M10 | M11 outcome handlers (M31 removal, M30 confirmed invalid if chosen) | lib (TS) | Add DS-06; emit EV-04 in the same transaction | REQ-037 |
+| IF-11a ReviewQueue.file | M11 | M17, M18, M30, M31, M36, M43, M47, M02 (dead letters) | lib / job | File a typed DS-14 item | REQ-064 |
+| IF-11b ReviewQueue.registerType | M11 | same modules as above | lib | Register the item type's schema, console view and **outcome handler** (runs on EV-07 in the owning module) | REQ-064 |
+
+### 7.4 Product and markets (Phase 3)
+
+| IF | Owner | Users | Style | Purpose | REQs |
+|---|---|---|---|---|---|
+| IF-12a HsCatalogue | M12 | M13, M14, M37, M40 | read | Hierarchy browse, code lookup (version-aware), policy status, vector search over descriptions | REQ-005, REQ-006, REQ-007 |
+| IF-12b HsCorrelation | M12 | M40, M14 | read | Map codes between nomenclature versions | REQ-009 |
+| IF-13a HsSuggest | M13 | M04 pages, M16 | http | Free text → candidates with confidence and explanations (vector search + IF-03a rerank); anonymous via IF-05c | REQ-004, REQ-005 |
+| IF-14a MarketStats | M14 | M16 | read | Ranked DS-10 rows for an HS code | REQ-010, REQ-011, REQ-013 |
+| IF-15a Coverage | M15 | M16, M26, M37 (coverage page) | read | DS-09 for (country, HS heading) with country fallback | REQ-012 |
+| IF-16a MarketFinder | M16 | M04 pages | http | Ranking + coverage + shortlist countries (writes through IF-07a) | REQ-010–014, REQ-004 |
+
+### 7.5 Buyer knowledge acquisition (Phase 4, R3)
+
+| IF | Owner | Users | Style | Purpose | REQs |
+|---|---|---|---|---|---|
+| IF-17a SanctionsScreen | M17 | M29, M34, M32 (rpc); M24, M18 pipeline (lib) | rpc / lib | Screen an entity or a free-text name → clear / possible / confirmed hit | REQ-029 |
+| IF-18a Resolve | M18 | M20, M21, M23, M53 | lib | Candidate record → existing or new company id + confidence; low-confidence merges filed with M11 | REQ-021, REQ-064 |
+| IF-19a Classify | M19 | M20, M21, M53 | lib | Logistics flag and buyer type with evidence | REQ-016, REQ-020 |
+| IF-20a DiscoveryRequest | M20 | M26 (cold search), M02 schedule (pre-warm) | job | Discover buyers for (HS heading, country); dedupe in-flight requests per key; EV-05 on completion | REQ-015, REQ-024 |
+| IF-21a CustomsIngest | M21 | M02 schedule | job | Weekly batch → aggregates as assertions | REQ-018, REQ-019, REQ-021, REQ-022 |
+| IF-22a EnrichContacts | M22 | EV-01 handler, M25 | job | Domain → role contacts and contact-type availability | REQ-016, REQ-032, REQ-033 |
+| IF-23a RegistryLookup / DomainSignals | M23 | M18 (anchors), M24, M32 (via M24) | lib (cached) | Registry match, domain age, MX, free-mail classification | REQ-027, REQ-030 |
+| IF-24a TrustEvaluate(entity) | M24 | EV-01 handler | job | Produce DS-08 for a catalogue company; stored as assertions and projected | REQ-027, REQ-028 |
+| IF-24b TrustEvaluate(ad-hoc) | M24 | M32 | rpc | DS-08 for free-text input, without writing to the catalogue | REQ-030 |
+| IF-25a Reverify | M25 | M29 (rpc await with timeout), M30 (job) | rpc / job | Re-check the given contact assertions; writes the outcome and emits EV-06 | REQ-033, REQ-034 |
+
+### 7.6 Buyer serving, credits and trust (Phase 5)
+
+| IF | Owner | Users | Style | Purpose | REQs |
+|---|---|---|---|---|---|
+| IF-26a BuyerSearch | M26 | M04 pages, M35 (search export), M45 | http / lib | Query (HS/keyword, countries, filters, sort, logistics toggle) → IF-10a → rows + coverage + "finding more" state (starts IF-20a); anonymous preview mode | REQ-004, REQ-012, REQ-015, REQ-016, REQ-018, REQ-019, REQ-020, REQ-024, REQ-051 |
+| IF-27a BuyerProfile | M27 | M04 pages, M33, M34 | http / lib | ProfileDoc through IF-10a, with DS-07 driving warnings and enabled actions | REQ-017, REQ-021, REQ-022, REQ-027, REQ-028, REQ-029 |
+| IF-28a Ledger | M28 | M29, M30, M32, M35, M36, M43, M46 | lib | `quote` → `hold` → `commit`/`release`; `refund(ref)`; `grant`; `balance`; all idempotent (DS-12) | REQ-034, REQ-054, REQ-056 |
+| IF-28b Allowances | M28 | M29, M32, M35, M10 (entitlement provider) | lib | Monthly free and plan allowances remaining | REQ-051 |
+| IF-28c PriceCatalogue | M28 | M04 CostBadge, M37, M29, M32, M35 | lib / read | DS-13 lookup with version | REQ-054, REQ-066 |
+| IF-29a Reveal | M29 | M04 pages, M33 (bulk from shortlist) | http | Single or bulk reveal following the §8.2 sequence | REQ-029, REQ-032, REQ-033, REQ-034, REQ-054 |
+| IF-29b RevealedContacts | M29 | M35, M34, M38 | lib | Which values this account has revealed | REQ-048 |
+| IF-30a Report | M30 | M04 pages | http | File a report; immediate per-user hide; emits EV-13 | REQ-025 |
+| IF-30b UserHideProvider | M30 | M10 (via IF-10b) | lib | Per-account hidden companies and contacts | REQ-025 |
+| IF-31a PublicRemovalForm | M31 | public | http | Removal or correction request + email verification → M11 item | REQ-037 |
+| IF-32a CheckBuyer | M32 | M04 pages | http | Free-text → IF-24b + IF-17a + red-flag rules → DS-08 + advice; metered via IF-28b/28a | REQ-030, REQ-031, REQ-051 |
+| IF-32b RedFlagRules | M32 | M27 (contextual red flags), M37 (guide references) | lib | Scam-pattern rules shared between the tool and the profile | REQ-031 |
+
+### 7.7 Outreach, pipeline and commerce (Phases 6–7)
+
+| IF | Owner | Users | Style | Purpose | REQs |
+|---|---|---|---|---|---|
+| IF-33a Pipeline | M33 | M04 pages, M34, M35, M41, M42 | lib / http | Shortlist add (single/bulk), status change (emits EV-08), notes, the "My buyers" cross-workspace view | REQ-045, REQ-046, REQ-047 |
+| IF-34a DraftGenerate | M34 | M04 pages, M42 | http (streamed) | Policy check (IF-10a `draft` action) + IF-17a → IF-03a stream → footer from IF-34b → DS-16 | REQ-029, REQ-038, REQ-040 |
+| IF-34b ComplianceFooter | M34 | M34, M42, M49 | lib | Deterministic footer from IF-07b + the source types behind the buyer's evidence + recipient region | REQ-039 |
+| IF-34c DraftHandoff | M34 | M04 pages | http | Records copy/mailto/wa.me handoff → EV-09 | REQ-040 |
+| IF-35a Export | M35 | M04 pages | job | Shortlist or search export → IF-10a (`export` surface) + IF-29b → file in S3 with watermark → download link; plan caps | REQ-048 |
+| IF-36a Checkout / ManageSubscription | M36 | M04 pages | http | Plans in INR, Razorpay subscription creation, payment method update, cancellation | REQ-052, REQ-053 |
+| IF-36b RazorpayWebhook | M36 | Razorpay | http | Signature check + idempotency → EV-10; the only path that changes entitlements | REQ-053 |
+| IF-36c EntitlementProvider | M36 | M10 (via IF-10b), DS-01 build | lib | Current plan limits per account | REQ-051, REQ-052 |
+| IF-36d Invoices | M36 | M04 pages, M38 | http | GST invoice PDFs and GSTIN capture | REQ-053 |
+| IF-37a Content | M37 | M04, M13 (disclaimer), M24 (wording keys), M32, M34 (guidance) | read | Versioned, localisable content by key, HS chapter and sector | REQ-028, REQ-031, REQ-044, REQ-059, REQ-065, REQ-066 |
+| IF-38a DataRightsContributor (registration) | M38 | M05, M06, M07, M28, M29, M30, M32, M33, M34, M35, M36, M41, M45, M50, M52 | lib | Each module that holds user data registers `export(account)` and `erase(account)` with its retention rules. M38 fans out on EV-11. | REQ-061 |
+| IF-38b DataRightsRequest | M38 | M04 pages | http | View, download, delete, withdraw consent | REQ-061 |
+
+### 7.8 Should / Could extensions (Phases 8–9)
+
+| IF | Owner | Users | Style | Purpose | REQs |
+|---|---|---|---|---|---|
+| IF-40a ReconfirmHs | M40 | M04 pages, M13 | http | Lists flagged workspaces; re-confirm through IF-07a | REQ-009 |
+| IF-41a Reminders | M41 | M33, M42 | lib | Create, snooze or complete reminders; scheduler fires them | REQ-047 |
+| IF-41b Notify | M41 | M41, M45, M20 (via EV-05), M31 (requester confirmation, see §11) | lib | In-app + email (+ WhatsApp via M50); content checked through IF-10a `notify` | REQ-026, REQ-047, REQ-060 |
+| IF-41c Dashboard | M41 | M04 pages | read | Pipeline counts, reminders due, saved-search hits, balance (from IF-28a) | REQ-049 |
+| IF-42a FollowUpDraft | M42 | M04 pages | http | Uses DS-16 thread context + IF-34b + IF-41a | REQ-041 |
+| IF-43a MoneyBackRequest | M43 | M04 pages | http | Window check → M11 item → outcome: Razorpay refund via M36 + ledger adjustment via IF-28a | REQ-055 |
+| IF-44a OutcomeSink | M44 | EV-08 | event | Append outcome events to analytics | REQ-050 |
+| IF-45a SavedSearch | M45 | M04 pages | http / job | Store an IF-26a query; scheduled re-run through IF-10a; hits → IF-41b | REQ-026 |
+| IF-46a TopUp | M46 | M04 pages | http | Razorpay order → webhook → IF-28a grant(top-up) | REQ-056 |
+| IF-47a IecVerify | M47 | M04 pages | http / job | DGFT lookup or M11 manual item; badge flag on the profile, read by IF-34b | REQ-003 |
+| IF-48a SimilarBuyers | M48 | M27 | lib | pgvector neighbours on read models via IF-10a | REQ-023 |
+| IF-49a WhatsAppIntro / OnePager | M49 | M04 pages, M34 | lib / http | `wa.me` link text; reusable intro content that drafts can use | REQ-042, REQ-043 |
+| IF-50a WhatsAppChannel | M50 | M41 | lib | BSP template send for opted-in users (consent via IF-06a) | REQ-060 |
+| IF-51 (none) | M51 | — | — | Adds locale bundles to M04 i18n and localised content to M37; no new interface | REQ-058 |
+| IF-52a Membership | M52 | M01 (DS-01), M07 | lib | Members, roles, invitations, consultant multi-account switching; extends DS-01 with role | REQ-063 |
+| IF-53 (reuses IF-08b, IF-18a, IF-19a, IF-09a) | M53 | — | — | New connectors plug into the existing pipeline | REQ-015, REQ-018, REQ-022 |
+
+---
+
+## 8. Key interaction sequences
+
+Each sequence names the module doing each step. LLD specifies the error paths in detail. This section fixes the order and who is responsible for what.
+
+### 8.1 Anonymous try → signup (Flow 1, steps 1–5)
+1. M04 page → **M13** `IF-13a` (guarded by M05 `IF-05c`) → M12 vector search → M03 rerank → candidates. *(REQ-004, REQ-005)*
+2. The visitor picks a code. It is held in the anonymous session (M05), because no workspace exists yet.
+3. **M16** `IF-16a` → M14 `IF-14a` + M15 `IF-15a` → ranked countries with coverage labels. *(REQ-010, REQ-012)*
+4. The visitor picks countries → **M26** `IF-26a` in preview mode → M10 applies an `anonymous` entitlement (count + first N names + trust summary) → signup gate. *(REQ-004, REQ-051)*
+5. **M05** OTP → **M06** consent → **M07** onboarding. The anonymous session's HS code and countries **are carried into the new workspace** by M07. **[assumption]** *(REQ-001, REQ-002, REQ-062)*
+
+### 8.2 Contact reveal (M29)
 ```
-            start                  unit committed & more work
-  idle ─────────────▶ running ◀───────────────────────────────┐
-                        │  │                                   │
-    checkpoint-capable  │  │ outcome / signal / budget          │ resume / approve / user decision
-    stage done & listed │  ▼                                   │
-                        │  ├─▶ checkpoint ─────────────────────┤
-                        │  ├─▶ escalated ──────────────────────┤
-                        │  ├─▶ budget_stopped ──(resume+top-up)┤
-                        │  └─▶ crashed (implicit: lock dead) ──┘ (resume)
-                        ▼
-                      done  (every Must REQ has a Verdict and no auto-rework remains within limits)
+UI (CostBadge from IF-28c) → user confirms
+M29 → M10 IF-10a(surface=reveal)          ── deny if suppressed / sanctions / plan
+M29 → M28 IF-28a.hold(idempotency=reveal id)
+M29 → M17 IF-17a (rpc)                     ── hit ⇒ release hold, file M11 item if "possible", deny
+M29 → M09 read (via M10) contact slots; for each stale slot → M25 IF-25a (rpc, bounded wait)
+        timeout ⇒ show value marked "stale / unknown deliverability" (REQ-033, degraded mode)
+M29 → write DS-17 RevealRecord → M28 IF-28a.commit(hold)
+return values + deliverability status
 ```
+- Bulk reveal = one confirmation, one hold for the total, and a commit per buyer. Buyers that fail are released individually. *(REQ-034, REQ-054)*
+- **[assumption]** One reveal = one buyer's full set of company-level contacts for one credit-priced action (the price comes from DS-13, not from this document).
 
-| Transition | Triggered by | Module |
+### 8.3 Report and automatic refund (M30)
+1. `IF-30a` → per-user hide row (M30) → effective at once through `IF-10b`. EV-13.
+2. Contact reports: M25 re-verify job → EV-06.
+   - **Invalid confirmed:** M25 writes a negative assertion (EV-01 → projections exclude it for everyone). M30 finds the matching DS-17 and calls `IF-28a.refund(ref=commit)`, idempotent per (reveal, contact). The user is notified.
+   - **Not confirmed:** M30 applies the per-user monthly cap. Under the cap → refund. Over the cap → M11 item.
+3. Content reports ("not a buyer", "suspicious", "closed", "wrong product") → M11 item. The outcome handler (owned by M30) issues an `IF-09b` AssertionCommand (for example `not_buyer_for(HS)`, `closed`), and M09 applies it globally. *(REQ-025, REQ-034, REQ-064)*
+
+### 8.4 Removal request (M31)
+Public form (`IF-31a`, guarded by `IF-05c`) → email verification → M11 item → operator approves → M31 outcome handler → M10 `IF-10d Suppress` (DS-06 + EV-04 in one transaction) → M09 purges and rebuilds read models → confirmation email to the requester through the transactional ESP. From then on, ingestion (M18/M20/M21/M22) skips matching records via `IF-10c`. Corrections instead issue `IF-09b` with source type `operator`. *(REQ-037, REQ-064)*
+
+### 8.5 Web discovery, cold search (M26 → M20)
+M26 sees DS-09 with few or no results for (country, heading) → `IF-20a` (deduplicated by key) → UI shows "finding more buyers…" → M20: search API → crawl (M08 raw landing) → IF-10c → M03 classify/extract → M18 resolve → M19 classify → M09 `IF-09a` (evidence assertions with page refs) → EV-01 fan-out (M22 contacts, M23/M24 trust, M17 screen, projections) → EV-05 → M15 recompute cell, M26 refreshes the result set (polling or push **[assumption]**: polling in the MVP, push later via M41). *(REQ-012, REQ-015, REQ-017, REQ-024)*
+
+### 8.6 Batch customs ingestion (M21)
+Schedule → M08 raw landing → Parquet → per-company × heading aggregates → IF-10c → M18 → M19 (forwarder filter) → `IF-09a` aggregate assertions → EV-01 fan-out → M15 batch recompute at the end of the run. *(REQ-018, REQ-019, REQ-021, REQ-022)*
+
+### 8.7 Draft (M34)
+`IF-34a` → M27 profile via M10 (surface=`draft`; deny on sanctions or suppression) → M17 `IF-17a` → prompt built from M07 `IF-07b` + **company-level** evidence only → M03 stream → `IF-34b` footer appended in code (never produced by the LLM) → DS-16 stored → user copies or opens mailto → `IF-34c` → EV-09 → M33 sets "Contacted". *(REQ-029, REQ-038, REQ-039, REQ-040, REQ-046)*
+
+### 8.8 Payment (M36)
+Checkout (`IF-36a`) → Razorpay → webhook `IF-36b` (signature + idempotency) → subscription state → EV-10 → M28 `grant` for the period, M10 entitlement cache refresh. A daily reconcile job compares against Razorpay and files M11 items for mismatches. Client-side "success" redirects never change entitlements. *(REQ-052, REQ-053, REQ-054)*
+
+### 8.9 Data rights (M38)
+`IF-38b` → EV-11 → each `IF-38a` contributor runs `export` or `erase` as a job → M38 assembles the archive (S3, time-limited link) or confirms deletion. The ledger (M28) and invoices (M36) keep records for their legal retention period with personal fields minimised, as each contributor declares. Consent withdrawal goes through M06, and the contributors that depend on consent (M41 email, M50 WhatsApp) stop at once. *(REQ-061, REQ-062)*
+
+### 8.10 Sanctions list change (M17)
+Daily fetch → diff → EV-02 → full re-screen job (batched through M09 `IF-09c`) → changed flags written via `IF-09a` → EV-03 → projections + M10 cache invalidation → possible matches → M11 items. The owning handler (M17) writes the confirmed or cleared decision through `IF-09b`. *(REQ-029, REQ-064)*
+
+---
+
+## 9. Policy layer composition (M10)
+
+M10 is the most-shared component, so its boundaries are fixed here:
+
+- **Inputs:** DS-01, a **surface** (`search`, `profile`, `reveal`, `draft`, `export`, `notify`, `alert`, `similar`), and either a query (delegated to `IF-09d`) or a set of company ids.
+- **Rule pipeline (fixed order, per architecture §3.8):**
+  1. Global suppression (DS-06), matched against the identifiers carried in the read model → hidden.
+  2. Sanctions flag (provider: M17) → visible-with-warning; reveal, draft, export and notify are removed from allowed actions.
+  3. Licence flags (from DS-02 via the assertion ids in the doc) → field redaction per surface (display vs export).
+  4. Region / personal-data gating → redact the `named_person` class (always in the MVP) and apply region rules.
+  5. Logistics default-hide (field from M19 via the read model) → hidden unless the query sets the toggle.
+  6. Per-user hides (provider: M30).
+  7. Plan entitlements (provider: M36, with M28 allowances as the fallback) → result caps and action availability.
+- **Outputs:** filtered docs + DS-07 per doc + aggregate plan-limit metadata.
+- **Caching:** M10 may cache suppression and sanctions state in Redis. EV-03/EV-04 invalidate it. **Correctness must not depend on the cache**: suppression is also applied at read-model purge time (EV-04).
+- **Not M10's job:** pricing (M28), deciding what counts as stale (M25), trust rollup (M24).
+
+---
+
+## 10. Non-functional allocation to modules
+
+| Target (architecture §7) | Modules responsible | HLD notes |
 |---|---|---|
-| running → checkpoint | stage complete ∧ stage in Policy checkpoint list | M12 + M17 |
-| running → escalated | gate result `escalate`; `ask-user` in attended mode; guard/contract violation after re-prompt; verification exhausted with the router absent (pre-Phase 4); hand-edit policy | M12, raised from M10/M19/M27 |
-| running → budget_stopped | M05 exhausted notification, acted on at the next safe point | M12 |
-| (any) → crashed | process death; recognised on the next command via dead lock PID | M04 |
-| stopped state → running | `resume` / `approve` / escalation option / route override | M13 → M17/M29 → M12 |
-| running → done | next-unit rule step (4) with the done condition met | M12 |
-
-**Report on every stop:** entering any state other than `running` triggers I-REPORT (REQ-060). `ask-user` in attended mode is an `escalated` state that the CLI resolves immediately in the same process. In unattended mode the process exits.
-
----
-
-## 6. Key interaction flows
-
-### 6.1 Forward document stage (Milestone A)
-1. M12 selects `stage:<id>` (next-unit rule 2) and asks M05 via M06 per call.
-2. M10: I-STALE precondition check → context assembly → I-AGENT (`docs-write`) → I-DOC validate (one re-prompt) → I-VCS commit → I-STALE record → I-TRACE rebuild.
-3. M12 safe point → event → M13 prints `✓ <stage> $x`. After classification (M11), M13 prints the supported-type line (REQ-014).
-4. Hooks from M07: after design, architecture and impl-plan, M12 runs the M16 `consistency` unit; its Signals are queued (REQ-015).
-5. If the stage is in the checkpoint list → `checkpoint` (REQ-003).
-
-### 6.2 Increment (Milestone B)
-1. M12 expands the impl-plan's INC blocks (via I-TRACE) into `increment` units in plan order.
-2. The first unit that needs the sandbox triggers the M18 consent block. Consent is recorded in RunState; refusal → `escalated` (REQ-056).
-3. M19: agent (`code-write`, shell → M18) → Verification Gate in M18 → commit with `Refs` trailers (REQ-016, REQ-017). On failure: local retry, then a Signal.
-
-### 6.3 E2E (Milestone C)
-M21 derives scenarios (no source access) → I-DRIVER per supported type → flake filter → Requirement Judge → Verdicts written to `docs/e2e.md` and a verdict manifest → I-TRACE picks up E2E→Verdict edges → Signals for non-flaky failures → M14 coverage section (REQ-050–REQ-054).
-
-### 6.4 Rework loop (Milestone D, design F2)
-```
-M21 Signal ─▶ M04 queue ─▶ M25 Issue(key) ─▶ M26 EvidenceBundle (M08) + Attribution (rules + M06)
-   ─▶ M27 nearest-first target, impact preview (M09), cost (M05), gate
-        ├─ auto-proceed ─▶ M28 publish decision, M09 mark stale(cause=decision)
-        │                  ─▶ M12 schedules: rework-stage (M10 revise, guard) → downstream stale
-        │                     stages → rework-increment (M19) → e2e-regression (M21)
-        │                  ─▶ M28 outcome: resolved | recurred(→M27 steps back)
-        ├─ ask-user (attended) ─▶ M12 escalated → M13 prompt → M29 decision → M28
-        └─ escalate ─▶ M12 escalated, M14 escalation block, process exits
-```
-Every rework unit carries the go-back id so that M05 itemises rework cost (REQ-074). Caps are checked in M27 *before* any spend (REQ-037, REQ-072).
-
-### 6.5 Escalation and override (design F7)
-M27 returns `escalate` (medium confidence, not the nearest stage) → M12 persists the Escalation in RunState → M14 renders the block (options: router's pick first, alternatives, "accept as known issue", each with its exact command) → the process exits. Later: `route --to design` → M29 → user-authored plan → M27 gate (caps and budget only) → M28 → M12 resumes. The outcome is logged as `overridden` / later `resolved` (REQ-040, REQ-041).
-
-### 6.6 Resume and hand edit (design F4, F5)
-`resume` → M04 lock (recover a dead lock) → M04 reconcile state from M03 trailers → M05 top-up → M17 edit flow (M09 EditRecords → StaleSet with causes → confirm or apply policy) → M12 next-unit rule. Completed, non-stale units are never re-dispatched, because rule 2 selects only stale or missing units (REQ-006, REQ-027).
-
-### 6.7 Budget stop (design F4)
-M06 requests an Allowance from M05 per call and passes it on as the per-call cap. When the remaining budget hits zero, M05 emits `budget_exhausted`, and the in-flight call is bounded by its cap. M12 finishes or abandons the current unit at the safe point: a unit whose output was not committed is re-run on resume, never half-applied (design assumption 5) → `budget_stopped` → M14 report lists the remaining units (REQ-073). The warning at the threshold comes from M05's projection and is displayed by M13 (REQ-075).
-
-### 6.8 Critic on demand and promotion (design F3)
-`critic --app --flow sign-up` → M30 snapshot at HEAD, personas from the understanding/discovery docs → M31: M18 start app (consent reused if already given this run; otherwise it asks) → I-DRIVER exploration → coverage gate → findings (suppressing dismissed ones via M32) → `docs/critic/<ts>.md` + M32 records. `finding promote F-3` → M32 → Signal(source `critic`) in the M04 queue. If a run is active, M12 drains it at its next safe point. Otherwise it is routed on the next `resume`/`start` (REQ-042–REQ-048).
-
-### 6.9 Fast mode (design F6)
-`start` → M34 classifier call (via M06) suggests fast mode → the user chooses → M12 uses the `fast` ModeProfile from M07. The merged "brief" stage (M34 definition, executed by M10) must satisfy the combined contract profile: REQ blocks with acceptance intent plus the SupportedTypeVerdict. Every other interface is unchanged. In particular, M27's nearest-first ordering works over the profile's stage list, so fast-mode go-backs target `brief`, `impl-plan` or `implement` (REQ-008).
+| Search p95 < 1.5 s | M26, M09 (read model design), M10 | M10 filtering must be set-based in the query, not per-row calls. The SearchDoc carries the flags M10 needs. |
+| Reveal < 3 s fresh / < 15 s re-verify | M29, M25, M17 | The rpc budget is split: sanctions screen is short. Re-verify has a bounded wait, then degrades to "unknown". |
+| Draft < 10 s streamed | M34, M03 | Stream tokens. The footer is appended after the stream ends. |
+| Knowledge lag ≤ 24 h tolerated | M02, R3 modules | Serving never blocks on R3 except in the §3.4 exceptions. |
+| Vendor outage degradation | M08 connectors, M23, M25, M03 | Each returns an explicit "unknown / unavailable" result that downstream code turns into "unknown" checks or stale labels. |
+| Cost observability | M01 `IF-01b`, M02 correlation ids | Every vendor call is traceable to a job and, where applicable, a credit. |
+| Abuse / scraping | M05 `IF-05c`, M10 plan caps, M35 watermark, M39 | Anonymous and Free limits are enforced server-side in M10, not in the UI. |
+| Security | M01, M05 (admin MFA), M11 (audit) | Admin actions all go through M11 or audited admin endpoints. |
 
 ---
 
-## 7. How interfaces evolve across build phases
+## 11. Assumptions and open questions
 
-Implementer phases add modules incrementally. Each interface is defined in full when its provider is built, and consumers built earlier use the stated fallback.
+**Assumptions made in this HLD** (LLD may revisit them; each should be confirmed or changed explicitly):
+1. R1/R2 share one TS codebase. R3 is a separate Python deployable. Cross-plane synchronous calls are limited to the three rpc exceptions in §3.4.
+2. The global suppression list lives in the `knowledge` schema (so Python ingestion reads it locally) but is owned and written only by M10 on the TS side.
+3. Buyer read models (SearchDoc, ProfileDoc) are built by M09 in R3, and **only M10** reads them for serving. M26 and M27 define the fields they need as a contract with M09.
+4. Serving-originated fact changes (reports, operator corrections, sanctions decisions, confirmed merges) reach the evidence store only as `IF-09b` jobs, which keeps M09 the single writer.
+5. Credits are account-scoped. Consultant per-client balances (M52) will be sub-balances, not a re-key.
+6. One reveal action reveals all company-level contacts for one buyer. Pricing granularity itself belongs to DS-13.
+7. The anonymous session's chosen HS code and countries are carried into the first workspace at signup.
+8. Cold-search completion reaches the user by polling in the MVP. Push notifications arrive with M41.
+9. Dead-lettered jobs appear as a system review item type in M11.
+10. Identifier normalisation and hashing (for suppression) is one spec with shared test vectors, implemented in TS and Python.
+11. Before M36 exists, M10 and DS-01 use the Free-plan defaults from M28 allowance config, so Phases 5–6 can be verified end to end.
 
-| Interface / seam | Provider phase | Fallback before then |
-|---|---|---|
-| Signal queue (I-STATE) | Phase 0 (M04) | none needed. Producers from Phase 2 onward append; until M25 exists, M14 lists unconsumed signals as "unrouted findings" (implementer assumption 3) |
-| Shell executor hook (I-AGENT → I-SANDBOX) | Phase 2 (M18) | M06 denies shell tool use; Phase 1 stages are document-only |
-| Report section providers (I-REPORT) | M21, M28, M32 register their sections | render `n/a` |
-| Rework units in I-RUN | Phase 4 (M28 extends M12) | Verification failures and E2E failures stop the run as `escalated` with reason "routing unavailable" |
-| Issue attempt counts (M25) | Phase 4 | M19 counts per INC id against the M01 cap |
-| Dismissal suppression (I-FINDINGS) | M32 | M30 doesn't suppress anything (M30 and M32 ship in the same phase) |
-| Fast profile content | Phase 6 (M34) | only the `full` profile is registered |
-
----
-
-## 8. Cross-cutting concerns
-
-### 8.1 Traceability (P3)
-IDs originate in authored documents (M11 stages, M19 commit trailers, M21 scenarios, finding producers). Only M02 parses them and only M08 relates them. No other module maintains its own ID mapping. Every published artefact that refers to requirements (commit trailers, Signals, Issues, RoutingDecisions, Verdicts, Findings) carries REQ ids as plain tokens that M02/M08 can resolve (REQ-020–REQ-024).
-
-### 8.2 Permissions (P9, REQ-056)
-Permission is a property of the **stage manifest** (M07), enforced by **M06**. Read-only roles: M16 LLM layer, M20, M21 deriver and judge, M26 attributor, M30/M31. Docs-write: M11 stages and M34 brief. Code-write: M19 only. Web content seen by M23/M31 agents is untrusted input, and those roles have no write tools.
-
-### 8.3 Error taxonomy and handling
-| Class | Examples | Handling |
-|---|---|---|
-| Recoverable in-unit | contract violation, guard violation, verification failure | one re-prompt / bounded retry inside the L3 module |
-| Routable | review/E2E/consistency/critic issue, exhausted verification | Signal → router |
-| Policy stop | caps, low confidence, insufficient budget for rework, hand-edit policy, consent refused | Escalation (M12), process exits with a report |
-| Budget | exhausted | `budget_stopped` at the safe point |
-| Infrastructure | API error, container runtime missing, git conflict | retry with backoff inside M06/M18/M03, then `escalated` with a diagnostic; a missing container runtime without opt-in → escalation offering `local-restricted` |
-| Crash | process death | lock recovery + reconciliation on resume |
-
-No path loops without counting against a cap: in-unit retries count toward the Issue attempts (REQ-037).
-
-### 8.4 Determinism and re-derivability
-Everything in `.pipeline/` except `state.json`, the append-only logs and evidence can be rebuilt from `docs/` + git. The next unit is a pure function of (RunState, StaleSet, profile, pending decisions, signal queue). This is what makes resume cheap (REQ-006) and hand edits authoritative (REQ-026).
-
-### 8.5 Cost attribution
-Every WorkUnit carries ledger tags. M06 forwards them on every call. Critic calls are tagged with a critic session id, plus the run id if a run was active. M14 itemises cost by stage, by go-back and for the critic (REQ-074).
-
-### 8.6 Observability
-Events (M04) drive the progress lines and status. Transcripts (M06) drive verbose mode. `routing.jsonl` drives accuracy review (REQ-041). The report is rewritten at every stop.
-
----
-
-## 9. Extension points
-
-| Extension | Mechanism | Owner of the contract |
-|---|---|---|
-| New stage / new mode | StageManifest + role template + contract profile, registered in M07 | M07, M02 |
-| New product type | I-DRIVER plug-in + a SupportedTypeVerdict value | M21 |
-| New signal source | Signal record with a new source kind; M25 normaliser rule | M04, M25 |
-| New attribution rule | rule entry in M26's rule set | M26 |
-| New host (plugin) | alternative M06 adapter + M36 shell over the M13 verbs | M06, M36 |
-| Baseline | M35 reuses I-SANDBOX, I-E2E (shared scenario set) and I-LEDGER; separate worktree and run tags | M35 |
-
----
-
-## 10. Non-functional notes that shape the design
-
-### 10.1 Scale
-≤ ~200 REQs, ≤ ~50 INCs and hundreds of scenarios fit comfortably in full rebuilds of M08, so incremental rebuild is an optimisation only. M09 hashing is linear in document size.
-
-### 10.2 Latency
-Wall-clock time is dominated by model calls and E2E. v1 dispatches units sequentially. The only concurrency allowed in v1 is (a) the critic process running beside a run and (b) M21 running independent scenarios in parallel inside one unit, if low-level design chooses to.
-
-### 10.3 Concurrent appends
-`ledger.jsonl`, `signals.jsonl` and `findings.jsonl` may be appended to by the run process and the critic process at the same time. Each record must be written with a single atomic append (or under a short per-file advisory lock). Readers must tolerate a truncated last line.
-
-### 10.4 Portability
-All paths go through M01-configured roots. Container runtime detection happens in M18.
-
----
-
-## 11. REQ → interface trace (Must requirements)
-
-| REQ | Carried by interface(s) | Modules |
-|---|---|---|
-| REQ-001, REQ-002 | I-CLI, I-RUN, I-STAGE | M13, M12, M10, M11 |
-| REQ-004, REQ-011, REQ-012 | I-DOC, I-STAGE | M02, M10 |
-| REQ-005 | I-STATE, I-REPORT, I-CLI | M04, M14, M13 |
-| REQ-006 | I-STATE, I-STALE, I-RUN | M04, M09, M12 |
-| REQ-009 | I-STATE (lock) | M04, M12 |
-| REQ-010, REQ-013 | I-REGISTRY, I-STALE, I-RUN | M07, M09, M12 |
-| REQ-014 | I-STAGEDEF (SupportedTypeVerdict), I-CLI, I-E2E | M11, M13, M21 |
-| REQ-015 | I-CONSIST, I-TRACE | M16, M08 |
-| REQ-016, REQ-017 | I-INCREMENT, I-SANDBOX, I-VCS | M19, M18, M03 |
-| REQ-018 | I-REVIEW, I-AGENT (read-only) | M20, M06 |
-| REQ-020–REQ-024 | I-DOC, I-TRACE, I-CONSIST, I-REPORT | M02, M08, M16, M14 |
-| REQ-026 | I-STALE, I-VCS, I-HUMAN | M09, M03, M17 |
-| REQ-030–REQ-032 | I-ROUTER (M26, M28) | M26, M28 |
-| REQ-033 | I-STALE preview, I-LEDGER history, I-ROUTER (M27) | M09, M05, M27 |
-| REQ-034 | Signal queue (I-STATE), I-ROUTER (M25) | M04, M16, M19, M20, M21, M32, M25 |
-| REQ-035–REQ-037 | I-ROUTER (M27), I-CFG | M27, M01, M29 |
-| REQ-038 | I-STAGE revise + guard, I-STALE, I-VCS | M10, M09, M03, M28 |
-| REQ-039 | I-E2E regression, I-ROUTER (M28) | M21, M28 |
-| REQ-042–REQ-048 | I-CRITIC, I-FINDINGS, I-DRIVER, I-SANDBOX | M30, M31, M32, M22, M23, M18 |
-| REQ-050–REQ-053 | I-E2E, I-DRIVER, I-SANDBOX | M21, M22, M23, M18 |
-| REQ-056 | I-SANDBOX (consent, isolation), I-AGENT (permissions, shell hook) | M18, M06 |
-| REQ-060 | I-REPORT | M14 |
-| REQ-070, REQ-072–REQ-074 | I-LEDGER, I-AGENT | M05, M06, M27, M13, M14 |
-
-Should and Could requirements follow the same mapping as the coverage matrix in `docs/implementer.md`. Their carrying interfaces are named in §4 (e.g. REQ-003 → I-HUMAN, REQ-025 → I-DECISIONS, REQ-040/REQ-041 → I-ROUTER M29/M28, REQ-049 → M33 hook, REQ-080 → M35, REQ-081 → I-AGENT swap + M36).
-
----
-
-## 12. Design decisions made at this level
-
-| # | Decision | Why | Modules |
-|---|---|---|---|
-| HD-1 | **M04 owns the Signal queue** (`.pipeline/signals.jsonl`), not M25 | Producers (M16, M19, M20, M21) are built before M25 and all already depend on M04, so this avoids an upward dependency | M04, M16, M19, M20, M21, M25, M32 |
-| HD-2 | **All L3 executors share the WorkUnit → UnitOutcome shape** | One dispatch path in M12. Resume and ledger tagging stay uniform | M10, M16, M19, M20, M21, M33 |
-| HD-3 | **Rework is expressed as ordinary WorkUnits with `mode = revise` and a decision id**, not a separate engine | Reuses M10/M19/M21 unchanged. The Preservation Guard stays in one place | M12, M28, M10, M19, M21 |
-| HD-4 | **M06 denies shell by default and M18 registers as the executor** | M06 comes before M18 in the build order, and REQ-056 must hold in every phase | M06, M18 |
-| HD-5 | **M14 uses section providers** registered by later modules | Satisfies the implementer's "n/a until filled" without M14 depending upward | M14, M21, M28, M32, M16, M20 |
-| HD-6 | **Critic promotion is asynchronous via the queue**; the run process drains it at safe points | Keeps AD-15 (the critic never takes the run lock) intact | M30, M32, M04, M12, M25 |
-| HD-7 | **M09 offers a non-mutating "preview" staleness computation** | M27 must show impact (REQ-033) before the gate decides | M09, M27 |
-| HD-8 | **Nearest-first is computed over the active ModeProfile's stage order** | Fast mode has a different stage chain | M27, M07, M34 |
-| HD-9 | **Before Phase 4, failures that would be routed stop the run as `escalated` (reason "routing unavailable")** | Stays honest under P8 and avoids silent pass-through | M12, M19, M21 |
-
----
-
-## Assumptions
-1. Module boundaries and dependencies are as listed in `docs/implementer.md`. Where this HLD adds a seam (HD-1, HD-4, HD-5), it doesn't add a new build-time dependency, except that producers of Signals use I-STATE, which they already reach transitively through M06/M12.
-2. Verdicts are stored in two places: a human-readable view in `docs/e2e.md` and a machine-readable verdict manifest that M08 reads. Low-level design picks the manifest location under `.pipeline/`, consistent with architecture §3.7 ("test manifests and verdict files").
-3. The consent given for the sandbox is per run and is reused by the critic's app mode within the same run. A standalone critic session (no active run) asks for its own consent.
-4. "Safe point" means that the last completed unit is committed and the state is recorded. A unit that was in progress when a stop occurred is re-executed from the start on resume.
-5. Router calibration (M26) reads only the local project's `routing.jsonl` in v1. A user-level aggregate stays an open architecture question.
-6. Parallelism within E2E is optional and does not change any interface.
-
-## Open questions
-1. **Verb collision:** M17's checkpoint `reject` and M29's `reject` (accept as known issue) share a name. Proposal: `checkpoint approve|reject` and `route reject <decision>`. Low-level design to confirm.
-2. **Critic report commits:** should `docs/critic/*.md` written while no run is active be committed by a lightweight M03 call that bypasses the run lock (safe, because the path is disjoint), or left for the user? This HLD assumes they are left uncommitted until the next pipeline commit.
-3. **Issue key stability:** what normalisation makes two failures "the same issue" across rework (same REQ + same scenario? same finding fingerprint?). This drives recurrence detection (REQ-035) and the attempt caps (REQ-037). Owned by M25 low-level design.
-4. **Regression smoke subset size and selection** (M21) directly trades REQ-039 confidence against cost. Needs a policy key in M01.
-5. **Review finding threshold:** which severities from M20 become Signals versus report-only entries? Proposal: a policy key, defaulting to "major and above".
-6. **Downstream redo after a revise-mode stage:** when revising REQ-007 in design changes only that block, do downstream stages run in revise mode scoped to the propagated stale blocks (the assumed default), or can some be skipped when M09 finds no downstream block referencing the changed ID?
-7. **Preservation Guard for sections without IDs** (architecture open question 4) remains open. The guard currently falls back to whole-section hashing, which may force escalations on prose-only edits.
-8. **Plugin shape (M36)** is still blocked on architecture open question 6. Nothing in this HLD assumes one option over the other, beyond keeping M06 and the M13 verb layer as the swap points.
+**Open questions for LLD / the author:**
+1. **Notification dependency gap:** M31 (removal confirmation to the requester) and M20/M26 (discovery-complete notices) need outbound email before M41 exists. Proposal: M05's transactional ESP client is exposed as a minimal `send transactional email` utility in Phase 1, and M41 later wraps it. LLD should confirm which module owns the ESP client.
+2. **Invalid-contact suppression:** should a confirmed-invalid contact become a negative assertion only (current design, reversible by re-verification), or also a DS-06 suppression? This HLD uses a negative assertion only, because suppression is for removal requests.
+3. **Merge follow-through:** when M18 merges companies, M29 reveal records, M30 hides and M33 shortlist entries point to old ids. This HLD assumes they resolve through DS-03 merge lineage at read time, not through rewrites. LLD should confirm.
+4. **Trust recompute scope:** does a change to any assertion trigger M24, or only changes to attribute classes that affect trust? This HLD assumes EV-01 carries the changed attribute classes and M24 filters on them.
+5. **Coverage recompute granularity:** per EV-05 (cell-level) plus at the end of each batch run. Does M15 also need a periodic full recompute for freshness decay? A periodic full recompute is recommended.
+6. **Search engine migration:** IF-09d's query primitives should be defined so that a future move to OpenSearch or Typesense (architecture §7) changes only M09/M10 internals, not M26.
+7. **REQ-035** has no module. The HLD only reserves the `named_person` class (DS-04) and M10 rule 4. There is nothing more to design until legal clearance.
+8. **REQ-022** is US-only until M53. The SearchDoc/ProfileDoc sourcing fields must allow "unknown" to be shown distinctly from "no".
+9. Carried from earlier stages without change: US customs vendor (M21), GST invoicing route (M36), refund cap and freshness thresholds (M30, M25), trust-wording legal review (M24, M37), and the web-discovery precision bar (M20, gating M26 display).
