@@ -33,6 +33,7 @@ import type {
   StageOutcome,
 } from "../orchestrator/types.js";
 import { LAST_IMPLEMENTED_STAGE, NOT_IMPLEMENTED_REASONS } from "../orchestrator/stage-meta.js";
+import { CostScraper } from "./cost-scraper.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -626,26 +627,13 @@ function pushLine(stream: LogLine["stream"], text: string): void {
   broadcast("line", line);
 }
 
-/**
- * Scrapes the cumulative spend out of the orchestrator's own console output.
- *
- * It is deliberately a reader of what the CLI already prints rather than a
- * second accounting system: the numbers a human sees in the UI and in a
- * terminal are then the same numbers, and the CLI stays the single source of
- * truth for money. `(cumulative $X of $Y)` and the final `Total cost: $X`
- * both carry the running total, so the maximum seen is the total so far.
- */
+/** Spend for the current run, scraped from the orchestrator's own output. */
+const costScraper = new CostScraper();
+
 function updateCostFromLine(text: string): void {
-  const patterns = [/cumulative \$([0-9]+\.[0-9]+)/, /Total cost: \$([0-9]+\.[0-9]+)/];
-  for (const pattern of patterns) {
-    const match = pattern.exec(text);
-    if (match === null) continue;
-    const value = Number.parseFloat(match[1] ?? "");
-    if (Number.isFinite(value) && value > run.costUsd) {
-      run = { ...run, costUsd: value };
-      broadcast("run", run);
-    }
-  }
+  if (!costScraper.observe(text)) return;
+  run = { ...run, costUsd: costScraper.totalUsd };
+  broadcast("run", run);
 }
 
 /** Splits a chunk into lines, keeping a partial tail until its newline arrives. */
@@ -714,6 +702,7 @@ async function handleStartRun(req: IncomingMessage, res: ServerResponse): Promis
   child = spawned;
   logBuffer = [];
   seq = 0;
+  costScraper.reset();
   run = {
     running: true,
     startedAt: new Date().toISOString(),
@@ -903,6 +892,21 @@ const server = http.createServer((req, res) => {
     if (!res.headersSent) sendError(res, 500, message);
     else res.end();
   });
+});
+
+// A busy port is an ordinary thing, usually this server already running in
+// another terminal. Without a handler Node emits an unhandled 'error' event and
+// dumps a stack trace, which reads like a crash rather than a fixable situation.
+server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`Port ${PORT} is already in use on ${BIND_HOST}.`);
+    console.error("");
+    console.error("  Most likely this UI is already running — try http://localhost:" + PORT);
+    console.error(`  To run a second copy on another port:  PORT=4318 npm start`);
+    process.exit(1);
+  }
+  console.error(`agent-pipeline UI failed to start: ${err.message}`);
+  process.exit(1);
 });
 
 server.listen(PORT, BIND_HOST, () => {

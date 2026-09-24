@@ -2,4 +2,4 @@
 
 # Product idea
 
-An automated multi-agent product development pipeline that takes a raw product idea and carries it through research, product classification, deep discovery, planning, architecture, incremental implementation, code review and end-to-end testing — with a feedback router that can send work back to any earlier stage, and an on-demand critic agent that reviews output from a human/UX perspective.
+I want to build a website which can find clients and connection details for export business. I am from India.

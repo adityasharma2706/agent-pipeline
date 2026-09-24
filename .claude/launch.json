@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "janadarsh-preview",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["/Users/adityasharma/agent-files/projects/janadarsh/releases/standalone/devserver.py", "4173"],
+      "port": 4173
+    },
+    {
+      "name": "agent-pipeline-ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "projects/agent-pipeline", "start"],
+      "port": 4317,
+      "autoPort": true
+    }
+  ]
+}

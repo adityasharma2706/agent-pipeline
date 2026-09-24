@@ -137,9 +137,16 @@ stopped rather than rebuilding.
 
 **`--max-go-backs N`** (default **3**) caps how many times one run may send
 execution back to an earlier stage. **`--critic <target>`** runs a single
-on-demand critic session and nothing else. Those three are the only flags;
-anything else starting with `--` is rejected rather than silently written into
-`docs/idea.md`.
+on-demand critic session and nothing else.
+
+**`--force-idea`** (a switch, off by default) permits replacing `docs/idea.md`
+with a *different* idea while earlier stages have already run against the old
+one. Without it that situation is **refused** — see *Re-running* below. Use it
+only when you actually mean "carry on against documents that describe the other
+idea".
+
+Those four are the only flags; anything else starting with `--` is rejected
+rather than silently written into `docs/idea.md`.
 
 Around each stage the loop calls `beginStage` + `saveState` *before* invoking
 the agent, then `finishStage(stage, outcome)` + `saveState` after. So
@@ -161,9 +168,17 @@ what is left undone, and tells you to re-run.
 **Re-running:**
 
 - *Mid-pipeline* (e.g. `state.stage` is `product-understanding`): the run
-  resumes at the next stage and says so. Passing a *different* idea on the
-  command line at that point prints a warning — the completed stages ran
-  against the old one.
+  resumes at the next stage and says so.
+- *Mid-pipeline with a different idea*: **refused, exit 1, nothing spent.** The
+  completed stages, every document in `docs/`, and the code already in the
+  workspace all describe the old idea; continuing builds the new idea's name
+  onto the old idea's design. This used to be a warning the run then ignored,
+  which cost one real run $1.99 building the *previous* product's modules. The
+  refusal prints both ideas and the exact commands to start cleanly (`rm
+  state/run.json`, `./setup.sh`, blank `docs/`, a fresh `PIPELINE_WORKSPACE`).
+  Pass `--force-idea` to override deliberately; the override is never applied
+  silently. Ideas are compared with whitespace and line wrapping normalised, so
+  re-wrapping the same text is not a "different idea".
 - *After the last implemented stage completed*: the orchestrator reports that it is already
   complete, lists the artifacts, and tells you to `rm state/run.json &&
   ./setup.sh` to start fresh (note `setup.sh` does not clear `docs/`). It does
@@ -323,6 +338,23 @@ failure — exactly why the orchestrator rejected it. Failures are appended just
 like successes: a module that failed honestly and said why is more useful than
 one that quietly stubbed. It is also the resume ledger, which is what makes
 `--max-modules` a resumable cap rather than a truncation.
+
+**Workspace identity: a ledger belongs to one plan.** Module ids are
+*positional* — every product's `docs/implementer.md` starts at `M01` — so an
+entry keyed only by `"M01"` says nothing about which product it came from.
+Pointing a new idea at an old workspace would therefore read `M01`-`M04` as
+"already complete" and skip them, silently shipping one product's code as
+another's first four modules. So the ledger records a **`planHash`** (a hash of
+`docs/implementer.md`, the document the modules are literally derived from) and
+an advisory `ideaHash`, and on load a mismatch is a **hard halt before anything
+is spent**. A ledger with *no* hash — one written before this existed — counts
+as unknown provenance and is refused too, not assumed to match; assuming is the
+failure being prevented. An empty ledger is adopted and stamped, so a fresh
+workspace just works.
+
+Resolving a mismatch is *your* decision, never the orchestrator's: point
+`PIPELINE_WORKSPACE` at a new directory, or move/remove the old workspace
+yourself. **The orchestrator never deletes a workspace.**
 
 ### The feedback loop (reviewer -> feedback-router -> go-back)
 

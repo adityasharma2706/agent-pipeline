@@ -83,8 +83,14 @@ import {
   typecheckWorkspace,
   workspaceRoot,
 } from "./workspace.js";
-import { appendProgress, completedModuleIds, loadProgress } from "./progress.js";
-import type { ProgressLog } from "./progress.js";
+import {
+  appendProgress,
+  checkLedgerProvenance,
+  completedModuleIds,
+  hashDocument,
+  loadProgress,
+} from "./progress.js";
+import type { LedgerIdentity, ProgressLog } from "./progress.js";
 import { parseReportedProgress, verifyModule } from "./verify.js";
 
 /**
@@ -569,6 +575,22 @@ async function runDocumentStage(
 }
 
 /**
+ * The identity a ledger written by THIS run would carry: a hash of the plan the
+ * modules come from, plus the idea, for a human reading the file.
+ */
+async function currentLedgerIdentity(): Promise<LedgerIdentity> {
+  const planText = await readFile(path.join(PROJECT_ROOT, IMPLEMENTER_DOC), "utf-8");
+  const planHash = hashDocument(planText);
+  if (planHash === null) {
+    throw new Error(
+      `${IMPLEMENTER_DOC} is empty, so the progress ledger cannot be tied to a plan. ` +
+        `Run the implementation-planning stage first.`
+    );
+  }
+  return { planHash, ideaHash: hashDocument(await readIdeaDocBody()) };
+}
+
+/**
  * The module loop: one query() per module, verified by this process after each.
  *
  * Success is never the agent's self-report. After every call the orchestrator
@@ -595,7 +617,20 @@ async function runModuleStage(
   }
 
   const modules = await loadModules(IMPLEMENTER_DOC);
-  let progress: ProgressLog = await loadProgress();
+
+  // Before anything is skipped OR spent: prove the ledger in this workspace was
+  // built from THIS plan. Module ids are positional, so a stale ledger from a
+  // different product would silently mark M01-Mnn complete and ship its code as
+  // this product's. The check is free and happens before the first query().
+  const identity = await currentLedgerIdentity();
+  const loaded = await loadProgress();
+  // THROWS rather than returning a failed StageResult: a ledger from another
+  // product is a configuration fault, and the retry loop would just print the
+  // same refusal three more times before halting anyway.
+  const provenance = checkLedgerProvenance(loaded, identity);
+  if (!provenance.ok) throw new Error(provenance.message);
+
+  let progress: ProgressLog = provenance.log;
   const completed = completedModuleIds(progress);
   const pending = modules.filter((module) => !completed.has(module.id));
 
@@ -1110,6 +1145,10 @@ export {
   estimateGoBackUsd,
   nextLinearStage,
 };
+// Pure decision helpers, exported so they can be exercised without running a
+// stage: parseCliArgs owns --force-idea, isSameIdea owns the refusal gate.
+export { parseCliArgs, isSameIdea };
+export type { CliArgs };
 export type { FeedbackRouterDecision, RunState };
 
 const IDEA_DOC_HEADER =
@@ -1173,9 +1212,16 @@ interface CliArgs {
    * that target and does nothing else — no stage runs, no state is touched.
    */
   critic: string | null;
+  /**
+   * `--force-idea`. Opt-in permission to replace docs/idea.md with a different
+   * idea while earlier stages' artifacts still describe the old one. Off by
+   * default and never applied silently: without it that situation is refused.
+   */
+  forceIdea: boolean;
 }
 
 const FLAGS_WITH_VALUES = ["--max-modules", "--max-go-backs", "--critic"] as const;
+const BOOLEAN_FLAGS = ["--force-idea"] as const;
 
 /**
  * Splits `--flags` out of the product idea. Before Phase 4 every argument was
@@ -1187,6 +1233,7 @@ function parseCliArgs(argv: string[]): CliArgs {
   let maxModules = DEFAULT_MAX_MODULES;
   let maxGoBacks = DEFAULT_MAX_GO_BACKS_PER_RUN;
   let critic: string | null = null;
+  let forceIdea = false;
 
   const positiveInteger = (name: string, value: string | undefined): number => {
     const parsed = Number(value);
@@ -1206,9 +1253,21 @@ function parseCliArgs(argv: string[]): CliArgs {
     const eq = arg.indexOf("=");
     const name = eq === -1 ? arg : arg.slice(0, eq);
     let value = eq === -1 ? undefined : arg.slice(eq + 1);
+
+    if ((BOOLEAN_FLAGS as readonly string[]).includes(name)) {
+      // A boolean flag takes no value, so it must not swallow the next argv
+      // entry — `--force-idea "an app that..."` has to stay idea text.
+      if (value !== undefined) {
+        throw new Error(`${name} is a switch and takes no value (got "${value}").`);
+      }
+      forceIdea = true;
+      continue;
+    }
+
     if (!(FLAGS_WITH_VALUES as readonly string[]).includes(name)) {
       throw new Error(
-        `Unrecognised option "${name}". Supported flags are ${FLAGS_WITH_VALUES.join(", ")}.`
+        `Unrecognised option "${name}". Supported flags are ` +
+          `${[...FLAGS_WITH_VALUES, ...BOOLEAN_FLAGS].join(", ")}.`
       );
     }
     if (value === undefined) {
@@ -1229,7 +1288,7 @@ function parseCliArgs(argv: string[]): CliArgs {
   }
 
   const idea = words.join(" ").trim();
-  return { idea: idea.length > 0 ? idea : null, maxModules, maxGoBacks, critic };
+  return { idea: idea.length > 0 ? idea : null, maxModules, maxGoBacks, critic, forceIdea };
 }
 
 /** The idea currently recorded in docs/idea.md, or null if there isn't one. */
@@ -1244,6 +1303,25 @@ async function readIdeaDocBody(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Whether two idea texts are the same idea.
+ *
+ * The comparison stays the one that was already good enough to detect this
+ * case — equality of the idea-doc body — widened only for whitespace and line
+ * wrapping, which are formatting, not meaning. Nothing looser: this gate now
+ * stops a run, and a real change slipping past it is the expensive direction.
+ */
+function isSameIdea(a: string, b: string): boolean {
+  const normalise = (text: string): string => text.replace(/\s+/g, " ").trim();
+  return normalise(a) === normalise(b);
+}
+
+/** One-line form of an idea for a console message. */
+function truncateForMessage(idea: string): string {
+  const flat = idea.replace(/\s+/g, " ").trim();
+  return flat.length > 120 ? `${flat.slice(0, 117)}...` : flat;
 }
 
 /** Persists the idea so re-runs and downstream stages can read it. */
@@ -1349,14 +1427,52 @@ async function main(): Promise<void> {
   }
 
   // Resuming mid-pipeline is supported, but changing the idea mid-pipeline is
-  // not: the already-completed stages ran against the old one.
+  // not: the already-completed stages ran against the old one. This used to be
+  // a warning the run then ignored, which cost a real user $1.99 building the
+  // PREVIOUS product's modules under the new idea's name. It is a refusal now,
+  // taken before anything is spent or written.
   if (state0.stage !== null) {
     const previousIdea = await readIdeaDocBody();
-    if (previousIdea !== null && previousIdea !== idea) {
+    if (previousIdea !== null && !isSameIdea(previousIdea, idea)) {
+      if (!cli.forceIdea) {
+        console.error(
+          `Refusing to run: ${IDEA_DOC} is being replaced with a DIFFERENT idea, but stages up ` +
+            `to "${state0.stage}" already ran against the previous one.`
+        );
+        console.error("");
+        console.error(`  on disk now: ${truncateForMessage(previousIdea)}`);
+        console.error(`  you passed:  ${truncateForMessage(idea)}`);
+        console.error("");
+        console.error(
+          `Continuing would build the new idea's name onto the old idea's design: every ` +
+            `document in docs/ and every module already in the code workspace describes the ` +
+            `idea on disk. Nothing has been spent, and ${IDEA_DOC} has NOT been changed.`
+        );
+        console.error("");
+        console.error("To start the new idea cleanly:");
+        console.error("");
+        console.error("  rm state/run.json");
+        console.error("  ./setup.sh");
+        console.error(`  PIPELINE_WORKSPACE=~/agent-pipeline-workspace-<new> \\`);
+        console.error(`    npm run orchestrator -- "${truncateForMessage(idea)}"`);
+        console.error("");
+        console.error(
+          "setup.sh does NOT clear docs/ — blank those files back to their header comment " +
+            "first, or the new run reads the old product's documents. A separate " +
+            "PIPELINE_WORKSPACE keeps the old product's code and its progress ledger intact."
+        );
+        console.error("");
+        console.error(
+          `To continue against the existing run state anyway — knowing the earlier stages ran ` +
+            `on the other idea — re-run with --force-idea.`
+        );
+        process.exitCode = 1;
+        return;
+      }
       console.warn(
-        `Warning: ${IDEA_DOC} is being replaced with a different idea, but stages up to ` +
-          `"${state0.stage}" already ran against the previous one. Reset state/run.json ` +
-          "for a coherent run."
+        `--force-idea: ${IDEA_DOC} is being replaced with a different idea even though stages ` +
+          `up to "${state0.stage}" already ran against the previous one. Proceeding because you ` +
+          `asked; the artifacts in docs/ still describe the old idea.`
       );
       console.warn("");
     }
