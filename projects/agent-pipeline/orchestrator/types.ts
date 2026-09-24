@@ -27,12 +27,23 @@ export type AuxiliaryAgent = "feedback-router" | "critic";
 
 export type AgentName = PipelineStage | AuxiliaryAgent;
 
+/**
+ * Terminal outcome of one stage attempt.
+ *
+ * "partial" arrived with Phase 4. spec-implementer runs a bounded number of
+ * modules per invocation (`--max-modules`), so an attempt can end having done
+ * real, correct, recorded work without the stage being finished. Calling that
+ * "success" would advance `state.stage` past a stage with 34 modules left;
+ * calling it "failure" would burn a retry for something that did not fail.
+ */
+export type StageOutcome = "success" | "failure" | "partial";
+
 /** A single entry in the run's history log. */
 export interface HistoryEntry {
   stage: PipelineStage | AuxiliaryAgent;
   startedAt: string;
   finishedAt: string | null;
-  outcome: "success" | "failure" | "in-progress" | null;
+  outcome: StageOutcome | "in-progress" | null;
 }
 
 /** Per-stage retry counters, keyed by stage name. */

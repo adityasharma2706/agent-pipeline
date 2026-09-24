@@ -5,7 +5,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PIPELINE_STAGES } from "./types.js";
-import type { HistoryEntry, PipelineStage, RunState } from "./types.js";
+import type { HistoryEntry, PipelineStage, RunState, StageOutcome } from "./types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE_PATH = path.join(__dirname, "..", "state", "run.json");
@@ -26,6 +26,7 @@ function isHistoryEntry(value: unknown): value is HistoryEntry {
     entry.outcome === null ||
     entry.outcome === "success" ||
     entry.outcome === "failure" ||
+    entry.outcome === "partial" ||
     entry.outcome === "in-progress";
   return (
     typeof entry.stage === "string" &&
@@ -149,7 +150,7 @@ export function beginStage(state: RunState, stage: PipelineStage): RunState {
 export function finishStage(
   state: RunState,
   stage: PipelineStage,
-  outcome: "success" | "failure"
+  outcome: StageOutcome
 ): RunState {
   const now = new Date().toISOString();
   const history = [...state.history];
