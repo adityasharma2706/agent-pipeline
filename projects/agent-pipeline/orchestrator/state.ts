@@ -1,9 +1,10 @@
-// Read/write helpers for state/run.json. Phase 0: wiring only, no agent
-// execution logic lives here.
+// Read/write helpers for state/run.json. No agent execution logic lives here:
+// these are pure state transitions plus load/save.
 
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PIPELINE_STAGES } from "./types.js";
 import type { HistoryEntry, PipelineStage, RunState } from "./types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -12,14 +13,56 @@ const STATE_FILE_PATH = path.join(__dirname, "..", "state", "run.json");
 /** Max times a single stage may be retried before the orchestrator must stop. */
 export const MAX_RETRIES_PER_STAGE = 3;
 
+/**
+ * History entries may name an auxiliary agent (feedback-router/critic) as well
+ * as a linear stage, so `stage` is only checked for being a string. `outcome`
+ * is checked exactly, because the control loop and (later) the feedback-router
+ * branch on it.
+ */
+function isHistoryEntry(value: unknown): value is HistoryEntry {
+  if (typeof value !== "object" || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  const outcomeOk =
+    entry.outcome === null ||
+    entry.outcome === "success" ||
+    entry.outcome === "failure" ||
+    entry.outcome === "in-progress";
+  return (
+    typeof entry.stage === "string" &&
+    typeof entry.startedAt === "string" &&
+    (entry.finishedAt === null || typeof entry.finishedAt === "string") &&
+    outcomeOk
+  );
+}
+
+/**
+ * Validates the persisted shape properly rather than loosely: an unrecognised
+ * `stage` string used to survive validation and then silently restart the run
+ * from the first stage (PIPELINE_STAGES.indexOf(garbage) === -1, so
+ * nextLinearStage returned index 0), which looks like a working resume but
+ * isn't one.
+ */
 function isRunState(value: unknown): value is RunState {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
-  return (
-    ("stage" in candidate) &&
-    Array.isArray(candidate.history) &&
-    typeof candidate.retries === "object" &&
-    candidate.retries !== null
+
+  if (!("stage" in candidate)) return false;
+  if (
+    candidate.stage !== null &&
+    !(
+      typeof candidate.stage === "string" &&
+      (PIPELINE_STAGES as readonly string[]).includes(candidate.stage)
+    )
+  ) {
+    return false;
+  }
+
+  if (!Array.isArray(candidate.history) || !candidate.history.every(isHistoryEntry)) return false;
+
+  const retries = candidate.retries;
+  if (typeof retries !== "object" || retries === null || Array.isArray(retries)) return false;
+  return Object.values(retries as Record<string, unknown>).every(
+    (count) => typeof count === "number" && Number.isInteger(count) && count >= 0
   );
 }
 
@@ -52,8 +95,10 @@ export async function loadState(): Promise<RunState> {
 
   if (!isRunState(parsed)) {
     throw new Error(
-      `state/run.json does not match the expected RunState shape ` +
-        `(needs "stage", "history": [], "retries": {}) at ${STATE_FILE_PATH}. ` +
+      `state/run.json does not match the expected RunState shape at ${STATE_FILE_PATH} ` +
+        `(needs "stage": null or a known pipeline stage name, "history": an array of ` +
+        `{stage, startedAt, finishedAt, outcome} entries, "retries": an object of ` +
+        `stage -> non-negative integer). ` +
         `Fix or delete it and re-run ./setup.sh to regenerate.`
     );
   }
@@ -66,20 +111,69 @@ export async function saveState(state: RunState): Promise<void> {
 }
 
 /**
- * Advances the run's current stage and appends a history entry.
+ * `state.stage` means "the last stage that COMPLETED SUCCESSFULLY" — the
+ * control loop resumes at nextLinearStage(state.stage). Only finishStage with
+ * outcome "success" may move it.
+ *
+ * Opens a history entry for an attempt about to start. Persisting this before
+ * the agent runs is deliberate: if the process is killed mid-stage, the entry
+ * stays "in-progress", which is the honest record of what happened.
  * Does not invoke any agent — purely a state transition helper.
  */
-export function advanceStage(state: RunState, nextStage: PipelineStage): RunState {
+export function beginStage(state: RunState, stage: PipelineStage): RunState {
   const entry: HistoryEntry = {
-    stage: nextStage,
+    stage,
     startedAt: new Date().toISOString(),
     finishedAt: null,
     outcome: "in-progress",
   };
   return {
     ...state,
-    stage: nextStage,
     history: [...state.history, entry],
+  };
+}
+
+/**
+ * Closes the open ("in-progress") history entry for `stage` with a real
+ * `finishedAt` and a terminal outcome, and — on success only — advances
+ * `state.stage`. A failed attempt stays in history as a failure rather than
+ * disappearing, so the run's record shows what was actually tried.
+ *
+ * Closes the MOST RECENT open entry for the stage; an entry abandoned by an
+ * earlier crashed run stays "in-progress", because that is what happened to it.
+ *
+ * If there is no open entry (e.g. a stage recorded by a future caller that
+ * never called beginStage), an already-closed entry is appended instead of
+ * throwing: losing the record would be worse than an approximate startedAt.
+ */
+export function finishStage(
+  state: RunState,
+  stage: PipelineStage,
+  outcome: "success" | "failure"
+): RunState {
+  const now = new Date().toISOString();
+  const history = [...state.history];
+
+  let openIndex = -1;
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const entry = history[i];
+    if (entry !== undefined && entry.stage === stage && entry.outcome === "in-progress") {
+      openIndex = i;
+      break;
+    }
+  }
+
+  const open = openIndex === -1 ? undefined : history[openIndex];
+  if (open === undefined) {
+    history.push({ stage, startedAt: now, finishedAt: now, outcome });
+  } else {
+    history[openIndex] = { ...open, finishedAt: now, outcome };
+  }
+
+  return {
+    ...state,
+    stage: outcome === "success" ? stage : state.stage,
+    history,
   };
 }
 

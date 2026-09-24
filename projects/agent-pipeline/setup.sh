@@ -60,5 +60,5 @@ fi
 echo ""
 echo "== Next steps =="
 echo "1. cp .env.example .env and fill in ANTHROPIC_API_KEY"
-echo "2. npm run orchestrator   # runs the Phase 0 state-wiring skeleton"
+echo "2. npm run orchestrator -- \"your product idea here\""
 echo "3. See README.md for the phased build order"
