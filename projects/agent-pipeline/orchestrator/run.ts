@@ -1,9 +1,10 @@
 // orchestrator/run.ts
 //
-// Phase 1: the first three stages run for real against the Claude Agent SDK.
-//   product-understanding -> product-alignment -> deep-discovery
-// Everything past deep-discovery is still stubbed (see STAGE_IO below), as are
-// feedback-router and critic.
+// Phase 2: the first six stages run for real against the Claude Agent SDK.
+//   product-understanding -> product-alignment -> deep-discovery ->
+//   design-planning -> architecture-planning -> implementation-planning
+// Everything past implementation-planning is still stubbed (see STAGE_IO
+// below), as are feedback-router and critic.
 
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -37,8 +38,11 @@ const PERMISSION_MODE: PermissionMode = "bypassPermissions";
  */
 const MAX_BUDGET_USD_PER_STAGE = 2.0;
 
-/** Phase 1 stops here; the later stages have no STAGE_IO entry yet. */
-const LAST_IMPLEMENTED_STAGE: PipelineStage = "deep-discovery";
+/** The phase this build implements, used only for console/error wording. */
+const CURRENT_PHASE = 2;
+
+/** Phase 2 stops here; the later stages have no STAGE_IO entry yet. */
+const LAST_IMPLEMENTED_STAGE: PipelineStage = "implementation-planning";
 
 /** Where the raw product idea is persisted so re-runs and agents can see it. */
 const IDEA_DOC = "docs/idea.md";
@@ -50,8 +54,8 @@ interface StageIo {
 }
 
 /**
- * Stage doc I/O as data rather than a pile of if-statements. Only the Phase 1
- * stages have entries; the rest throw a clear "not implemented" error.
+ * Stage doc I/O as data rather than a pile of if-statements. Only the stages
+ * implemented so far have entries; the rest throw "not implemented".
  */
 const STAGE_IO: Partial<Record<PipelineStage, StageIo>> = {
   "product-understanding": {
@@ -66,18 +70,38 @@ const STAGE_IO: Partial<Record<PipelineStage, StageIo>> = {
     reads: [IDEA_DOC, "docs/product_understanding.md", "docs/classification.md"],
     writes: "docs/okf.md",
   },
+  "design-planning": {
+    reads: [IDEA_DOC, "docs/product_understanding.md", "docs/classification.md", "docs/okf.md"],
+    writes: "docs/design.md",
+  },
+  "architecture-planning": {
+    reads: ["docs/okf.md", "docs/design.md"],
+    writes: "docs/architecture.md",
+  },
+  "implementation-planning": {
+    reads: ["docs/design.md", "docs/architecture.md"],
+    writes: "docs/implementer.md",
+  },
 };
 
-/** Which phase a not-yet-implemented stage is scheduled for, for error text. */
+/**
+ * Which phase a stage belongs to, for error/console text. Anything at or
+ * before LAST_IMPLEMENTED_STAGE ships in CURRENT_PHASE; everything after it is
+ * the next phase at the earliest — hence "Phase N+" wording at the call sites.
+ * (This used to be hardcoded 1-or-2, which silently went wrong the moment
+ * LAST_IMPLEMENTED_STAGE moved past Phase 1's last stage.)
+ */
 function phaseForStage(stage: PipelineStage): number {
-  return PIPELINE_STAGES.indexOf(stage) <= PIPELINE_STAGES.indexOf(LAST_IMPLEMENTED_STAGE) ? 1 : 2;
+  return PIPELINE_STAGES.indexOf(stage) <= PIPELINE_STAGES.indexOf(LAST_IMPLEMENTED_STAGE)
+    ? CURRENT_PHASE
+    : CURRENT_PHASE + 1;
 }
 
 function stageIo(stage: PipelineStage): StageIo {
   const io = STAGE_IO[stage];
   if (io === undefined) {
     throw new Error(
-      `Stage "${stage}" has no doc I/O mapping — not implemented until Phase ${phaseForStage(stage)}.`
+      `Stage "${stage}" has no doc I/O mapping — not implemented until Phase ${phaseForStage(stage)}+.`
     );
   }
   return io;
@@ -226,7 +250,7 @@ async function runStage(stageName: PipelineStage): Promise<StageResult> {
  * SDK, and parse its output into a FeedbackRouterDecision[] that the control
  * loop can act on (i.e. re-run decision.target_stage through the control loop).
  *
- * TODO(Phase 2+, once reviewer/testing-agent produce real feedback):
+ * TODO(Phase 3+, once reviewer/testing-agent produce real feedback):
  * implement the SDK call and the output parsing/validation against the
  * FeedbackRouterDecision shape.
  */
@@ -353,7 +377,9 @@ async function writeIdeaDoc(idea: string): Promise<void> {
  * error, which is what a user hit simply by running the orchestrator twice.
  */
 function reportAlreadyComplete(state: RunState, nextStage: PipelineStage | null): void {
-  console.log(`Phase 1 is already complete for this run: "${state.stage}" finished successfully.`);
+  console.log(
+    `Phase ${CURRENT_PHASE} is already complete for this run: "${state.stage}" finished successfully.`
+  );
   console.log("");
   console.log("Artifacts on disk:");
   for (const io of Object.values(STAGE_IO)) {
@@ -363,7 +389,9 @@ function reportAlreadyComplete(state: RunState, nextStage: PipelineStage | null)
   if (nextStage === null) {
     console.log("There is no further stage in PIPELINE_STAGES.");
   } else {
-    console.log(`The next stage ("${nextStage}") is not implemented until Phase ${phaseForStage(nextStage)}.`);
+    console.log(
+      `The next stage ("${nextStage}") is not implemented until Phase ${phaseForStage(nextStage)}+.`
+    );
   }
   console.log("To start a fresh run, reset the run state:");
   console.log("");
@@ -421,7 +449,9 @@ async function main(): Promise<void> {
 
   console.log(`Idea: ${idea}`);
   reportAuthSource();
-  console.log(`Phase 1 runs through "${LAST_IMPLEMENTED_STAGE}"; later stages are still stubbed.`);
+  console.log(
+    `Phase ${CURRENT_PHASE} runs through "${LAST_IMPLEMENTED_STAGE}"; later stages are still stubbed.`
+  );
   console.log(`MAX_RETRIES_PER_STAGE = ${MAX_RETRIES_PER_STAGE}`);
   if (state0.stage !== null) {
     console.log(`Resuming: last successful stage was "${state0.stage}", starting at "${firstStage}".`);
@@ -453,7 +483,7 @@ async function main(): Promise<void> {
 
       if (stage === LAST_IMPLEMENTED_STAGE) {
         console.log("");
-        console.log(`Stopping at "${LAST_IMPLEMENTED_STAGE}" — end of Phase 1.`);
+        console.log(`Stopping at "${LAST_IMPLEMENTED_STAGE}" — end of Phase ${CURRENT_PHASE}.`);
         break;
       }
       stage = nextLinearStage(stage);

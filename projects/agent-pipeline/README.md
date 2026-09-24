@@ -5,20 +5,29 @@ A multi-agent product-development pipeline built on the Claude Agent SDK
 research, classification, design, architecture, implementation, and review,
 with a feedback-router able to send work back to any earlier stage.
 
-**Phase 1 (current state):** the first three stages are wired to run for real
+**Phase 2 (current state):** the first six stages are wired to run for real
 against the Claude Agent SDK — `product-understanding -> product-alignment ->
-deep-discovery`, ending with a written `docs/okf.md`. The orchestrator's
-control loop calls `runStage()` per stage, verifies the stage's output doc was
-actually written, and persists state between stages. The remaining eight
-stages, plus `invokeFeedbackRouter()` and `invokeCritic()`, are still stubs and
-throw if reached.
+deep-discovery -> design-planning -> architecture-planning ->
+implementation-planning`, ending with a written `docs/implementer.md`. The
+orchestrator's control loop calls `runStage()` per stage, verifies the stage's
+output doc was actually written, and persists state between stages. The
+remaining five stages, plus `invokeFeedbackRouter()` and `invokeCritic()`, are
+still stubs and throw if reached.
 
-> **Not yet verified end to end.** The success path has never been run against
-> the live API — no full pipeline run has happened, so cost, runtime, and
-> output quality are all unknown, and any bug that only shows up once real SDK
-> traffic flows is still in there. What *has* been verified without spending
-> money: `tsc --noEmit`, the no-idea usage path, resuming mid-pipeline, the
-> already-complete path, rejection of a malformed `state/run.json`, and the
+The three planning stages carry requirement IDs end to end: `design-planning`
+assigns every functional requirement a stable `REQ-NNN` ID in `docs/design.md`,
+`architecture-planning` cites those IDs per component and decision, and
+`implementation-planning` maps each module to the IDs it satisfies and must
+list anything uncovered under a **Requirements not yet covered** heading. That
+last list exists because requirement omission is the biggest measured weakness
+of agentic build pipelines (`docs/okf.md` §0.5, §6) — traceability is what
+makes an omission visible instead of silent.
+
+> **Phase 1 verified live; Phase 2 not yet.** Phase 1's three stages have run
+> against the live API end to end (~$1.85, real artifacts on disk). The three
+> Phase 2 stages have *not* been run live yet. What *has* been verified without
+> spending money: `tsc --noEmit`, the no-idea usage path, resuming mid-pipeline,
+> the already-complete path, rejection of a malformed `state/run.json`, and the
 > config-fault halt (missing `agents/<stage>.md`).
 
 ## Setup
@@ -55,9 +64,9 @@ argument and the orchestrator will pick it up from there. With neither an
 argument nor a non-empty `docs/idea.md`, it prints usage and exits 1 without
 making any API calls.
 
-Phase 1 runs `product-understanding -> product-alignment -> deep-discovery`
-and then stops at the `LAST_IMPLEMENTED_STAGE` constant in
-`orchestrator/run.ts`. Per-stage and cumulative USD cost are logged.
+Phase 2 runs `product-understanding -> product-alignment -> deep-discovery ->
+design-planning -> architecture-planning -> implementation-planning` and then
+stops at the `LAST_IMPLEMENTED_STAGE` constant in `orchestrator/run.ts`. Per-stage and cumulative USD cost are logged.
 
 Around each stage the loop calls `beginStage` + `saveState` *before* invoking
 the agent, then `finishStage(stage, "success" | "failure")` + `saveState`
@@ -74,7 +83,7 @@ successful `finishStage` moves it; that is what a re-run resumes from.
   resumes at the next stage and says so. Passing a *different* idea on the
   command line at that point prints a warning — the completed stages ran
   against the old one.
-- *After Phase 1 completed*: the orchestrator reports that it is already
+- *After the last implemented stage completed*: the orchestrator reports that it is already
   complete, lists the artifacts, and tells you to `rm state/run.json &&
   ./setup.sh` to start fresh (note `setup.sh` does not clear `docs/`). It does
   not overwrite `docs/idea.md` in this case, and makes no API calls.
@@ -155,16 +164,19 @@ noting who writes it and who reads it next.
 
 - **Phase 0 (done):** scaffold — directory layout, agent definitions,
   doc placeholders, orchestrator state wiring. No SDK calls.
-- **Phase 1 (built, unverified against the live API):** vertical slice — real
-  SDK invocation for `product-understanding -> product-alignment ->
-  deep-discovery` only, with the orchestrator's control loop actually calling
-  `runStage` and persisting state between them. Confirming the success path
-  with a real run is the first thing Phase 2 should do.
-- **Phase 2+:** extend real invocation to the remaining stages
-  (`design-planning` through `testing-agent`), implement `feedback-router`'s
-  SDK call and output parsing against the `FeedbackRouterDecision` type, wire
-  `critic` for on-demand use, and add the Playwright MCP tools referenced as
-  a placeholder in `agents/testing-agent.md`.
+- **Phase 1 (done, verified live):** vertical slice — real SDK invocation for
+  `product-understanding -> product-alignment -> deep-discovery`, with the
+  orchestrator's control loop actually calling `runStage` and persisting state
+  between them.
+- **Phase 2 (built, not yet run live):** the three planning stages —
+  `design-planning -> architecture-planning -> implementation-planning` — plus
+  `docs/design.md` as design-planning's own artifact and `REQ-` ID
+  traceability across all three.
+- **Phase 3+:** extend real invocation to the remaining stages (`system-design`
+  through `testing-agent`), implement `feedback-router`'s SDK call and output
+  parsing against the `FeedbackRouterDecision` type, wire `critic` for
+  on-demand use, and add the Playwright MCP tools referenced as a placeholder
+  in `agents/testing-agent.md`.
 
 ## Layout
 
