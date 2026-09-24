@@ -44,6 +44,14 @@ export interface HistoryEntry {
   startedAt: string;
   finishedAt: string | null;
   outcome: StageOutcome | "in-progress" | null;
+  /**
+   * Why this entry says what it says, when that is not obvious from `outcome`
+   * alone. Optional and absent on every entry the normal control loop writes —
+   * it exists for `--accept-stage`, where "success" means "a human read the
+   * artifact and vouched for it", not "the stage's own call succeeded". Those
+   * are different facts and the run record should not merge them.
+   */
+  note?: string;
 }
 
 /** Per-stage retry counters, keyed by stage name. */

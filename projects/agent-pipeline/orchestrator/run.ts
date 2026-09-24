@@ -62,6 +62,7 @@ import type {
   AgentName,
   PipelineStage,
   FeedbackRouterDecision,
+  RetryCounts,
   RoutingLogEntry,
   RunState,
   StageOutcome,
@@ -92,6 +93,12 @@ import {
 } from "./progress.js";
 import type { LedgerIdentity, ProgressLog } from "./progress.js";
 import { parseReportedProgress, verifyModule } from "./verify.js";
+import {
+  DeterministicStageFailure,
+  buildDeterministicHaltMessage,
+  classifyResult,
+} from "./result-failure.js";
+import type { ArtifactStatus, DeterministicFailure } from "./result-failure.js";
 
 /**
  * The pipeline is non-interactive: there is no human sitting there to answer a
@@ -345,6 +352,119 @@ function hasRealContent(fileText: string): boolean {
   return fileText.replace(/<!--[\s\S]*?-->/g, "").trim().length > 0;
 }
 
+/** `--accept-stage`, named once so the flag parser and the halt message agree. */
+const ACCEPT_STAGE_FLAG = "--accept-stage";
+
+/** The command a human would run to accept `stage`'s artifact as-is. */
+function acceptCommandFor(stage: PipelineStage): string {
+  return `npm run orchestrator -- ${ACCEPT_STAGE_FLAG} ${stage}`;
+}
+
+/** "31KB", for a human eyeballing whether a cap was calibrated for this run. */
+function kb(bytes: number): string {
+  return `${Math.round(bytes / 1024)}KB`;
+}
+
+/**
+ * How big the documents this stage reads actually are. Printed on a budget
+ * halt because MAX_BUDGET_USD_PER_STAGE was calibrated against a much smaller
+ * plan, and the input size is the thing that moved — a human picking a new cap
+ * needs to see it rather than guess.
+ */
+async function describeInputs(reads: string[]): Promise<string> {
+  const parts: string[] = [];
+  for (const rel of reads) {
+    try {
+      const text = await readFile(path.join(PROJECT_ROOT, rel), "utf-8");
+      parts.push(`${rel} ${kb(Buffer.byteLength(text, "utf-8"))}`);
+    } catch {
+      parts.push(`${rel} (missing)`);
+    }
+  }
+  return parts.length > 0 ? parts.join(" + ") : "none";
+}
+
+/**
+ * Whether a document stage's output is there and real — the SAME check the
+ * success path in runDocumentStage applies, deliberately so: a cap failure that
+ * produced a good document must be reported with the same authority as a
+ * success, without being promoted to one.
+ */
+async function inspectDocumentArtifact(io: StageIo, outputRelPath: string): Promise<ArtifactStatus> {
+  let text: string;
+  try {
+    text = await readFile(path.join(PROJECT_ROOT, outputRelPath), "utf-8");
+  } catch {
+    return {
+      description: outputRelPath,
+      complete: false,
+      detail: "the file does not exist, so this call produced nothing.",
+    };
+  }
+  if (!hasRealContent(text)) {
+    return {
+      description: outputRelPath,
+      complete: false,
+      detail: `${Buffer.byteLength(text, "utf-8")} bytes, but header/placeholder only — no real content.`,
+    };
+  }
+
+  const flat = text.replace(/\s+/g, " ").trim();
+  const tail = flat.length > 70 ? `...${flat.slice(-70)}` : flat;
+  return {
+    description: outputRelPath,
+    complete: true,
+    detail:
+      `${kb(Buffer.byteLength(text, "utf-8"))} of real content, ending: "${tail}". ` +
+      `Inputs read: ${await describeInputs(io.reads)}.`,
+  };
+}
+
+/**
+ * Whether the workspace stage's output is complete: every module in the plan
+ * recorded as built in a ledger that provably belongs to THIS plan. Anything
+ * less is a half-built workspace, which must not be accepted as a finished
+ * stage — later stages would read it as if every module existed.
+ */
+async function inspectWorkspaceArtifact(moduleDoc: string): Promise<ArtifactStatus> {
+  const description = `${workspaceRoot()}/ (modules from ${moduleDoc})`;
+  try {
+    const modules = await loadModules(moduleDoc);
+    const provenance = checkLedgerProvenance(await loadProgress(), await currentLedgerIdentity());
+    if (!provenance.ok) return { description, complete: false, detail: provenance.message };
+
+    const completed = completedModuleIds(provenance.log);
+    const remaining = modules.filter((module) => !completed.has(module.id));
+    if (remaining.length > 0) {
+      return {
+        description,
+        complete: false,
+        detail:
+          `${completed.size} of ${modules.length} modules built; still to build: ` +
+          `${remaining.slice(0, 8).map((m) => m.id).join(", ")}${remaining.length > 8 ? ", ..." : ""}`,
+      };
+    }
+    return {
+      description,
+      complete: true,
+      detail: `all ${modules.length} modules recorded complete in the workspace progress ledger.`,
+    };
+  } catch (err) {
+    return {
+      description,
+      complete: false,
+      detail: `could not be verified: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/** Dispatches on the KIND of output, exactly as the run loop does. */
+async function inspectStageArtifact(io: StageIo): Promise<ArtifactStatus> {
+  return io.writes.kind === "document"
+    ? inspectDocumentArtifact(io, io.writes.path)
+    : inspectWorkspaceArtifact(io.writes.moduleDoc);
+}
+
 function collectAssistantText(message: SDKMessage, sink: string[]): void {
   if (message.type !== "assistant") return;
   for (const block of message.message.content) {
@@ -433,6 +553,14 @@ interface QueryOutcome {
    * rather than being trusted here.
    */
   structuredOutput: unknown;
+  /**
+   * Set when the call died on a cap that an identical re-run would hit again
+   * (see orchestrator/result-failure.ts). The caller must HALT rather than
+   * retry; `ok: false` alone does not say which kind of failure this was, and
+   * treating all of them as retryable is what made one live run pay four times
+   * for a document that was already complete after the first attempt.
+   */
+  deterministic: DeterministicFailure | null;
 }
 
 /**
@@ -493,6 +621,7 @@ async function runQueryOnce(
     costUsd: 0,
     numTurns: 0,
     structuredOutput: undefined,
+    deterministic: null,
   };
   let sawResultMessage = false;
 
@@ -502,20 +631,30 @@ async function runQueryOnce(
       if (message.type !== "result") continue;
 
       sawResultMessage = true;
-      const ok = message.subtype === "success" && !message.is_error;
+      const classification = classifyResult(message);
       outcome = {
-        ok,
+        ok: classification.kind === "success",
         text: message.subtype === "success" ? message.result : assistantText.join("\n"),
         costUsd: message.total_cost_usd,
         numTurns: message.num_turns,
         structuredOutput: message.subtype === "success" ? message.structured_output : undefined,
+        deterministic: classification.kind === "deterministic" ? classification.failure : null,
       };
-      if (!ok) console.error(`  [${label}] SDK result was not a success: ${message.subtype}`);
+      if (classification.kind === "deterministic") {
+        console.error(
+          `  [${label}] SDK result hit a deterministic cap: ${classification.failure.subtype} — ` +
+            `NOT retrying, an identical re-run would hit the same cap.`
+        );
+      } else if (classification.kind === "transient") {
+        console.error(`  [${label}] SDK result was not a success: ${classification.subtype}`);
+      }
     }
   } catch (err) {
+    // A thrown SDK error is transient by default: it never carried a result
+    // subtype, so there is nothing to classify and the retry budget applies.
     const detail = err instanceof Error ? err.message : String(err);
     console.error(`  [${label}] SDK call threw: ${detail}`);
-    return { ...outcome, ok: false, text: detail };
+    return { ...outcome, ok: false, text: detail, deterministic: null };
   }
 
   if (!sawResultMessage) {
@@ -540,6 +679,7 @@ async function runDocumentStage(
   // without building anything. Bootstrapping is idempotent, so this is safe.
   if (io.grants?.includes("workspace") === true) await ensureWorkspace();
 
+  const allowanceUsd = budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE);
   const outcome = await runQueryOnce(
     stageName,
     definition,
@@ -547,11 +687,31 @@ async function runDocumentStage(
     buildDocumentPrompt(stageName, io, outputRelPath),
     {
       cwd: resolveCwd(io),
-      maxBudgetUsd: budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE),
+      maxBudgetUsd: allowanceUsd,
       ...(additionalDirectories !== undefined ? { additionalDirectories } : {}),
     }
   );
   budget.record(outcome.costUsd);
+
+  // A cap failure is fatal, not retryable — the same idiom runStage already
+  // uses for configuration faults. Before halting, LOOK AT WHAT WAS WRITTEN:
+  // the stage may well have finished the document and then run out of cap on a
+  // later turn, which is precisely the case that used to be thrown away.
+  if (outcome.deterministic !== null) {
+    throw new DeterministicStageFailure(
+      buildDeterministicHaltMessage({
+        label: stageName,
+        failure: outcome.deterministic,
+        costUsd: outcome.costUsd,
+        numTurns: outcome.numTurns,
+        allowanceUsd,
+        perStageCapUsd: MAX_BUDGET_USD_PER_STAGE,
+        artifact: await inspectDocumentArtifact(io, outputRelPath),
+        acceptCommand: acceptCommandFor(stageName),
+      }),
+      outcome.deterministic.subtype
+    );
+  }
 
   const failed: StageResult = { ...outcome, ok: false, outcome: "failure", budgetHalt: false };
   if (!outcome.ok) return failed;
@@ -675,6 +835,7 @@ async function runModuleStage(
     const startedAt = new Date().toISOString();
     const before = await snapshotWorkspace();
 
+    const allowanceUsd = budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE);
     const outcome = await runQueryOnce(
       `${stageName}/${spec.id}`,
       definition,
@@ -682,7 +843,7 @@ async function runModuleStage(
       buildModulePrompt(spec, position, modules.length, [...completed]),
       {
         cwd: workspaceRoot(),
-        maxBudgetUsd: budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE),
+        maxBudgetUsd: allowanceUsd,
         // The design docs live outside the workspace cwd; this is what makes
         // them readable at all. They are still instructed to be read-only.
         additionalDirectories: [DOCS_DIR],
@@ -727,6 +888,39 @@ async function runModuleStage(
       console.error(`      FAILED — ${failureReason}`);
       notes.push(`${spec.id} failed: ${failureReason}`);
       aggregate.text = notes.join("\n");
+
+      // Same split as the document stages, with the module's own verification
+      // standing in for hasRealContent: the code this call wrote may be
+      // complete and typecheck-clean even though the call itself hit its cap.
+      // The progress entry above is already written either way, so the
+      // evidence survives the halt.
+      if (outcome.deterministic !== null) {
+        const artifactOk = verification.failureReason === null && written.length > 0;
+        throw new DeterministicStageFailure(
+          buildDeterministicHaltMessage({
+            label: `${stageName}/${spec.id}`,
+            failure: outcome.deterministic,
+            costUsd: outcome.costUsd,
+            numTurns: outcome.numTurns,
+            allowanceUsd,
+            perStageCapUsd: MAX_BUDGET_USD_PER_STAGE,
+            artifact: {
+              description: `${spec.id} in ${workspaceRoot()}/`,
+              complete: artifactOk,
+              detail: artifactOk
+                ? `${written.length} file(s) written and they pass the module verification ` +
+                  `(REQs ${verification.reqsClaimed.join(", ") || "none"}, typecheck clean). ` +
+                  `Recorded as a FAILED attempt in the workspace progress ledger.`
+                : (verification.failureReason ?? `${written.length} file(s) written.`),
+            },
+            // There is no --accept-stage for one module of a multi-module
+            // stage: the stage is not finished, so accepting it would claim
+            // modules that were never built.
+            acceptCommand: null,
+          }),
+          outcome.deterministic.subtype
+        );
+      }
       return { ...aggregate, ok: false, outcome: "failure" };
     }
 
@@ -828,15 +1022,36 @@ async function invokeFeedbackRouter(
       `valid answer.`,
   ].join("\n\n");
 
+  const allowanceUsd = budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE);
   const outcome = await runQueryOnce("feedback-router", definition, "feedback-router", prompt, {
     cwd: PROJECT_ROOT,
-    maxBudgetUsd: budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE),
+    maxBudgetUsd: allowanceUsd,
     outputSchema: ROUTER_OUTPUT_SCHEMA,
   });
   budget.record(outcome.costUsd);
 
   const base = { costUsd: outcome.costUsd, numTurns: outcome.numTurns, decisions: [] };
   if (!outcome.ok) {
+    // The router is not retried at all, so a cap failure costs nothing extra
+    // here — but the message still has to say WHICH cap, or a human re-runs
+    // into the same wall. `artifact: null`: the router's output is consumed in
+    // memory, so there is nothing on disk to look at or accept.
+    if (outcome.deterministic !== null) {
+      return {
+        ...base,
+        ok: false,
+        error: buildDeterministicHaltMessage({
+          label: "feedback-router",
+          failure: outcome.deterministic,
+          costUsd: outcome.costUsd,
+          numTurns: outcome.numTurns,
+          allowanceUsd,
+          perStageCapUsd: MAX_BUDGET_USD_PER_STAGE,
+          artifact: null,
+          acceptCommand: null,
+        }),
+      };
+    }
     return { ...base, ok: false, error: `the feedback-router call failed: ${outcome.text.slice(0, 300)}` };
   }
 
@@ -1072,12 +1287,37 @@ async function invokeCritic(target: string, budget: RunBudget): Promise<boolean>
       `what you say into ${CRITIC_LOG_DOC}.`,
   ].join("\n\n");
 
+  const allowanceUsd = budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE);
   const outcome = await runQueryOnce("critic", definition, "critic", prompt, {
     cwd: PROJECT_ROOT,
-    maxBudgetUsd: budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE),
+    maxBudgetUsd: allowanceUsd,
     additionalDirectories: [workspaceRoot()],
   });
   budget.record(outcome.costUsd);
+
+  if (outcome.deterministic !== null) {
+    // The critic is a single on-demand call with no retry loop, so this only
+    // has to say which cap stopped it. Its partial report is in outcome.text
+    // and is printed rather than being silently dropped.
+    console.error(
+      buildDeterministicHaltMessage({
+        label: "critic",
+        failure: outcome.deterministic,
+        costUsd: outcome.costUsd,
+        numTurns: outcome.numTurns,
+        allowanceUsd,
+        perStageCapUsd: MAX_BUDGET_USD_PER_STAGE,
+        artifact: null,
+        acceptCommand: null,
+      })
+    );
+    if (outcome.text.trim().length > 0) {
+      console.error("");
+      console.error("What the critic had said before it was cut off:");
+      console.error(outcome.text.trim());
+    }
+    return false;
+  }
 
   if (!outcome.ok) {
     console.error(`critic failed: ${outcome.text.slice(0, 500)}`);
@@ -1218,9 +1458,16 @@ interface CliArgs {
    * default and never applied silently: without it that situation is refused.
    */
   forceIdea: boolean;
+  /**
+   * `--accept-stage <stage>`. The manual escape hatch for a stage that hit a
+   * deterministic cap but left a complete artifact behind: record it as
+   * successful without re-running it. Like --critic it is a complete
+   * alternative to running the pipeline — it spends nothing and starts no stage.
+   */
+  acceptStage: PipelineStage | null;
 }
 
-const FLAGS_WITH_VALUES = ["--max-modules", "--max-go-backs", "--critic"] as const;
+const FLAGS_WITH_VALUES = ["--max-modules", "--max-go-backs", "--critic", ACCEPT_STAGE_FLAG] as const;
 const BOOLEAN_FLAGS = ["--force-idea"] as const;
 
 /**
@@ -1234,6 +1481,18 @@ function parseCliArgs(argv: string[]): CliArgs {
   let maxGoBacks = DEFAULT_MAX_GO_BACKS_PER_RUN;
   let critic: string | null = null;
   let forceIdea = false;
+  let acceptStage: PipelineStage | null = null;
+
+  const knownStage = (value: string | undefined): PipelineStage => {
+    const implemented = PIPELINE_STAGES.filter(isImplemented);
+    if (value === undefined || !(PIPELINE_STAGES as readonly string[]).includes(value)) {
+      throw new Error(
+        `${ACCEPT_STAGE_FLAG} needs a pipeline stage name, got "${value ?? ""}". ` +
+          `Stages with artifacts to accept: ${implemented.join(", ")}.`
+      );
+    }
+    return value as PipelineStage;
+  };
 
   const positiveInteger = (name: string, value: string | undefined): number => {
     const parsed = Number(value);
@@ -1277,6 +1536,7 @@ function parseCliArgs(argv: string[]): CliArgs {
 
     if (name === "--max-modules") maxModules = positiveInteger(name, value);
     else if (name === "--max-go-backs") maxGoBacks = positiveInteger(name, value);
+    else if (name === ACCEPT_STAGE_FLAG) acceptStage = knownStage(value?.trim());
     else {
       // --max-go-backs 0 is a positive-integer error above; --critic "" is not,
       // so it is rejected here rather than reaching the agent as an empty task.
@@ -1288,7 +1548,14 @@ function parseCliArgs(argv: string[]): CliArgs {
   }
 
   const idea = words.join(" ").trim();
-  return { idea: idea.length > 0 ? idea : null, maxModules, maxGoBacks, critic, forceIdea };
+  return {
+    idea: idea.length > 0 ? idea : null,
+    maxModules,
+    maxGoBacks,
+    critic,
+    forceIdea,
+    acceptStage,
+  };
 }
 
 /** The idea currently recorded in docs/idea.md, or null if there isn't one. */
@@ -1381,6 +1648,106 @@ function reportAlreadyComplete(state: RunState, nextStage: PipelineStage | null)
   );
 }
 
+/** What the history entry says about a stage a human accepted by hand. */
+const ACCEPTED_NOTE =
+  `accepted by a human with ${ACCEPT_STAGE_FLAG} — the stage's own call did not report success`;
+
+/**
+ * `--accept-stage <stage>`: record a stage as successful because its artifact
+ * is on disk and a human has read it, without paying to run the stage again.
+ *
+ * This is the other half of the deterministic-failure fix. Knowing that
+ * docs/hld.md was complete is worth nothing if the only way to act on it is to
+ * re-run the stage that produced it. It is deliberately a small manual escape
+ * hatch rather than an auto-promotion: a document written by a call that hit
+ * its budget cap MIGHT be truncated mid-thought, and that judgement needs eyes,
+ * not a byte count.
+ *
+ * Three guards, all refusals rather than warnings:
+ *   1. the stage must be one this build can actually run (it needs a STAGE_IO
+ *      entry, or there is no artifact to check);
+ *   2. it must be the stage the run would run NEXT — accepting anything else
+ *      would silently skip the stages in between;
+ *   3. the artifact must pass the same verification the success path applies.
+ *
+ * Nothing is spent and no agent runs; like --critic this is a complete
+ * alternative to running the pipeline.
+ */
+async function acceptStageArtifact(stage: PipelineStage, state0: RunState): Promise<boolean> {
+  const io = STAGE_IO[stage];
+  if (io === undefined) {
+    console.error(
+      `Refusing to accept "${stage}": it is not implemented in Phase ${phaseForStage(stage)}, so ` +
+        `it has no artifact this orchestrator knows how to check.`
+    );
+    console.error(`Acceptable stages: ${PIPELINE_STAGES.filter(isImplemented).join(", ")}.`);
+    return false;
+  }
+
+  const expected = nextLinearStage(state0.stage);
+  if (expected !== stage) {
+    console.error(
+      `Refusing to accept "${stage}": the run's next stage is ` +
+        `${expected === null ? "none — the pipeline is finished" : `"${expected}"`}, and the last ` +
+        `stage that completed successfully was ` +
+        `${state0.stage === null ? "none" : `"${state0.stage}"`}.`
+    );
+    console.error("");
+    console.error(
+      `${ACCEPT_STAGE_FLAG} only accepts the stage the run is actually stuck on. Accepting a ` +
+        `later stage would mark the ones in between as done without them ever running.`
+    );
+    return false;
+  }
+
+  const artifact = await inspectStageArtifact(io);
+  if (!artifact.complete) {
+    console.error(`Refusing to accept "${stage}": its output is missing or not real content.`);
+    console.error("");
+    console.error(`  ${artifact.description}`);
+    console.error(`  ${artifact.detail}`);
+    console.error("");
+    console.error(
+      `There is nothing here to vouch for, so the stage does have to run. Nothing was changed.`
+    );
+    return false;
+  }
+
+  // beginStage + finishStage rather than a hand-written entry, so the history
+  // this writes has the same shape every other entry has — plus a note, because
+  // "succeeded" and "a human said this was good enough" are different facts and
+  // the run record should not confuse them later.
+  const closed = finishStage(beginStage(state0, stage), stage, "success");
+  const history = [...closed.history];
+  const last = history[history.length - 1];
+  if (last !== undefined) history[history.length - 1] = { ...last, note: ACCEPTED_NOTE };
+  const retries: RetryCounts = { ...closed.retries };
+  delete retries[stage];
+  await saveState({ ...closed, history, retries });
+
+  const next = nextLinearStage(stage);
+  console.log(`Accepted "${stage}" without re-running it.`);
+  console.log("");
+  console.log(`  artifact: ${artifact.description}`);
+  console.log(`            ${artifact.detail}`);
+  console.log(`  recorded: state/run.json now says "${stage}" finished successfully; its retry`);
+  console.log(`            counter was cleared. No agent ran and nothing was spent.`);
+  console.log("");
+  console.log(`YOU are vouching for that artifact. The only automatic check applied is the`);
+  console.log(`one a successful run applies: the output exists and is not a placeholder.`);
+  console.log(`Nothing has verified that it is finished rather than truncated mid-thought,`);
+  console.log(`and every later stage builds on whatever is in there.`);
+  console.log("");
+  if (next === null || STAGE_IO[next] === undefined) {
+    console.log(`There is no further implemented stage to run.`);
+  } else {
+    console.log(`Continue the run from "${next}":`);
+    console.log("");
+    console.log("  npm run orchestrator");
+  }
+  return true;
+}
+
 async function main(): Promise<void> {
   await loadDotEnv();
 
@@ -1402,6 +1769,16 @@ async function main(): Promise<void> {
   }
 
   const state0 = await loadState();
+
+  // --accept-stage is also a complete alternative to running the pipeline, and
+  // is handled before docs/idea.md is touched: it is the move a human makes
+  // when a stage hit a deterministic cap but left a good artifact, and it must
+  // not start, resume or bill anything as a side effect of being asked for.
+  if (cli.acceptStage !== null) {
+    const accepted = await acceptStageArtifact(cli.acceptStage, state0);
+    if (!accepted) process.exitCode = 1;
+    return;
+  }
 
   // Resume/completion decisions happen BEFORE docs/idea.md is touched: a
   // finished run should not have its recorded idea overwritten by an argument

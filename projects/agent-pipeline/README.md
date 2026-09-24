@@ -145,7 +145,27 @@ one. Without it that situation is **refused** — see *Re-running* below. Use it
 only when you actually mean "carry on against documents that describe the other
 idea".
 
-Those four are the only flags; anything else starting with `--` is rejected
+**`--accept-stage <stage>`** records a stage as successful *without re-running
+it*, for the case where the stage hit a deterministic cap but left a complete
+artifact on disk:
+
+```
+npm run orchestrator -- --accept-stage system-design
+```
+
+Like `--critic`, it is a complete alternative to running the pipeline: no agent
+runs, nothing is spent, `docs/idea.md` is untouched. It refuses unless all three
+of these hold — the stage is one this build can run, it is the stage the run
+would run **next** (accepting a later one would silently skip the stages in
+between), and its artifact passes the same verification the success path applies
+(the document exists and has real content beyond its header; for
+`spec-implementer`, every module in the plan is recorded complete in a ledger
+that provably belongs to *this* plan). The history entry it writes carries a
+`note` saying a human accepted it, because "the stage succeeded" and "a human
+vouched for the file it left behind" are different facts. See *Deterministic
+failures* below for when you would want this.
+
+Those five are the only flags; anything else starting with `--` is rejected
 rather than silently written into `docs/idea.md`.
 
 Around each stage the loop calls `beginStage` + `saveState` *before* invoking
@@ -188,26 +208,68 @@ what is left undone, and tells you to re-run.
 retries the same stage; `recordRetry` throws past `MAX_RETRIES_PER_STAGE` (3)
 to halt the run. What counts as a retryable failure is a deliberate split:
 
-- *Retryable* (returned as `ok: false`, `outcome: "failure"`): an unsuccessful
-  SDK result, an error thrown by the SDK while streaming
-  (network/transport/auth), a stream that ends with no result message, a stage
+- *Retryable* (returned as `ok: false`, `outcome: "failure"`): an
+  `error_during_execution` SDK result, an error thrown by the SDK while
+  streaming (network/transport/auth), a stream that ends with no result
+  message, a stage
   that claims success without writing its output doc, and any module that fails
   one of `spec-implementer`'s four verification checks. A retry re-attempts only
   the failed module — completed ones are skipped.
 - *Not a failure at all* (`outcome: "partial"`): the module cap or the run
   budget stopped the work. No retry is spent.
-- *Not retryable* (thrown, halts immediately): a missing `STAGE_IO` entry or a
-  missing/malformed `agents/<stage>.md`. Retrying a configuration fault just
-  prints the same error three times.
+- *Not retryable* (thrown, halts immediately): a missing `STAGE_IO` entry, a
+  missing/malformed `agents/<stage>.md`, or an SDK result whose subtype is one
+  of the three **deterministic** caps below. Retrying a configuration fault just
+  prints the same error three times; retrying a cap failure also *spends the cap
+  again*.
 
 Halts print `Run halted: <message>` rather than a stack dump; set
 `PIPELINE_DEBUG=1` for the stack.
 
+### Deterministic failures (and why a cap failure is never retried)
+
+The SDK's error result subtypes are not interchangeable
+(`orchestrator/result-failure.ts` is the whole of this logic, and it imports the
+SDK for types only, so it can be exercised without an API key):
+
+| subtype | retried? | why |
+| --- | --- | --- |
+| `error_during_execution` | yes, up to `MAX_RETRIES_PER_STAGE` | may genuinely be transient — a network blip, a transport error |
+| `error_max_budget_usd` | **no** | the same prompt against the same `maxBudgetUsd` exhausts the cap again |
+| `error_max_turns` | **no** | same reason: the identical call runs out of turns at the identical point |
+| `error_max_structured_output_retries` | **no** | the SDK already retried internally; the schema or the agent has to change |
+
+This is the same fatal-vs-retryable split `runStage` already made for
+configuration faults — it simply had never been applied to result *subtypes*.
+
+It matters because of what it cost. On a live run of a 53-module product,
+`system-design` hit the $4.00 per-call cap, was recorded as a failure, and was
+re-run three more times at full price — while `docs/hld.md`, 48KB and complete,
+had been sitting on disk since the first attempt. The orchestrator threw away
+the evidence without ever looking at it.
+
+So on a deterministic failure the orchestrator now **halts immediately** and,
+before halting, **checks the stage's expected output exactly as the success path
+would** and says what it found. A document that exists and has real content is
+reported as `LOOKS COMPLETE`, with its size, its closing words, and the total
+size of the documents the stage read (the number to sanity-check the cap
+against). It is deliberately *not* auto-promoted to success: a document written
+by a call that hit its cap might be truncated mid-thought, and only a human can
+judge that. If it is good, `--accept-stage <stage>` records it and the run
+continues from the next stage. If it is not, the halt message names the constant
+to raise (`MAX_BUDGET_USD_PER_STAGE`) and what the call actually spent.
+
+Known limitation, stated rather than hidden: `--accept-stage` verifies that the
+artifact is real, not that it belongs to the current idea. A leftover document
+from a previous product would pass. That is what "you are vouching for it"
+means.
+
 ### Safety rails
 
 - **Per-call budget cap** (`MAX_BUDGET_USD_PER_STAGE`, default $4.00): passed
-  as the SDK's `maxBudgetUsd`. An `error_max_budget_usd` result is treated as
-  an ordinary failure, not a crash. Raised from $2.00 in Phase 3: the live
+  as the SDK's `maxBudgetUsd`. An `error_max_budget_usd` result **halts the run
+  immediately** rather than being retried — see *Deterministic failures* above.
+  Raised from $2.00 in Phase 3: the live
   Phase 2 stages cost ~$0.76 each, and `low-level-design` has to spec every
   module in `docs/implementer.md`. In Phase 4 it doubles as the per-*module*
   cap — one module's code is the same order of output as one document.
@@ -612,6 +674,12 @@ agent-pipeline/
                                 PURE — no SDK import, so the gate can be
                                 exercised without a billable call.
                    routing.ts   the append-only routing log + RD-n allocation
+                   result-failure.ts
+                                deterministic vs transient SDK result
+                                subtypes, and the halt message that reports
+                                what a capped call still managed to write.
+                                Type-only SDK import, so it too can be
+                                exercised without a billable call.
   setup.sh         idempotent bootstrap
 ```
 
