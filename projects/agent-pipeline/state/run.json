@@ -48,6 +48,12 @@
       "startedAt": "2026-09-24T12:45:27.625Z",
       "finishedAt": "2026-09-24T13:01:00.491Z",
       "outcome": "success"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-24T14:23:29.307Z",
+      "finishedAt": "2026-09-24T14:33:54.360Z",
+      "outcome": "partial"
     }
   ],
   "retries": {}
