@@ -5,29 +5,37 @@ A multi-agent product-development pipeline built on the Claude Agent SDK
 research, classification, design, architecture, implementation, and review,
 with a feedback-router able to send work back to any earlier stage.
 
-**Phase 2 (current state):** the first six stages are wired to run for real
+**Phase 3 (current state):** the first eight stages are wired to run for real
 against the Claude Agent SDK — `product-understanding -> product-alignment ->
 deep-discovery -> design-planning -> architecture-planning ->
-implementation-planning`, ending with a written `docs/implementer.md`. The
-orchestrator's control loop calls `runStage()` per stage, verifies the stage's
-output doc was actually written, and persists state between stages. The
-remaining five stages, plus `invokeFeedbackRouter()` and `invokeCritic()`, are
-still stubs and throw if reached.
+implementation-planning -> system-design -> low-level-design`, ending with a
+written `docs/lld.md`. The orchestrator's control loop calls `runStage()` per
+stage, verifies the stage's output doc was actually written, and persists state
+between stages. The remaining three stages, plus `invokeFeedbackRouter()` and
+`invokeCritic()`, are still stubs and throw if reached.
 
-The three planning stages carry requirement IDs end to end: `design-planning`
-assigns every functional requirement a stable `REQ-NNN` ID in `docs/design.md`,
-`architecture-planning` cites those IDs per component and decision, and
-`implementation-planning` maps each module to the IDs it satisfies and must
-list anything uncovered under a **Requirements not yet covered** heading. That
-last list exists because requirement omission is the biggest measured weakness
-of agentic build pipelines (`docs/okf.md` §0.5, §6) — traceability is what
-makes an omission visible instead of silent.
+Traceability runs end to end across those stages on two ID families.
+`design-planning` assigns every functional requirement a stable `REQ-NNN` ID in
+`docs/design.md`, `architecture-planning` cites those IDs per component and
+decision, and `implementation-planning` maps each module to the IDs it
+satisfies and must list anything uncovered under a **Requirements not yet
+covered** heading. `implementation-planning` also introduces module IDs
+(`M01`, `M02`, ...); `system-design` names the module IDs behind every
+interface and interaction in `docs/hld.md`, and `low-level-design` organises
+`docs/lld.md` by module ID and must close with a **Modules not yet specified**
+heading — emitted even when nothing is missing, because a heading that appears
+only on failure cannot be told apart from a skipped check. These lists exist
+because requirement omission is the biggest measured weakness of agentic build
+pipelines (`docs/okf.md` §0.5, §6) — traceability is what makes an omission
+visible instead of silent.
 
-> **Phase 1 verified live; Phase 2 not yet.** Phase 1's three stages have run
-> against the live API end to end (~$1.85, real artifacts on disk). The three
-> Phase 2 stages have *not* been run live yet. What *has* been verified without
-> spending money: `tsc --noEmit`, the no-idea usage path, resuming mid-pipeline,
-> the already-complete path, rejection of a malformed `state/run.json`, and the
+> **Phases 1 and 2 verified live; Phase 3 not yet.** Phase 1's three stages
+> have run against the live API end to end (~$1.85), and Phase 2's three
+> planning stages have too (~$2.28, 17 turns, resumed from Phase 1's state) —
+> real artifacts from both are on disk. The two Phase 3 stages have *not* been
+> run live yet. What *has* been verified without spending money: `tsc
+> --noEmit`, the no-idea usage path, resuming mid-pipeline, the
+> already-complete path, rejection of a malformed `state/run.json`, and the
 > config-fault halt (missing `agents/<stage>.md`).
 
 ## Setup
@@ -64,9 +72,9 @@ argument and the orchestrator will pick it up from there. With neither an
 argument nor a non-empty `docs/idea.md`, it prints usage and exits 1 without
 making any API calls.
 
-Phase 2 runs `product-understanding -> product-alignment -> deep-discovery ->
-design-planning -> architecture-planning -> implementation-planning` and then
-stops at the `LAST_IMPLEMENTED_STAGE` constant in `orchestrator/run.ts`. Per-stage and cumulative USD cost are logged.
+Phase 3 runs `product-understanding -> product-alignment -> deep-discovery ->
+design-planning -> architecture-planning -> implementation-planning ->
+system-design -> low-level-design` and then stops at the `LAST_IMPLEMENTED_STAGE` constant in `orchestrator/run.ts`. Per-stage and cumulative USD cost are logged.
 
 Around each stage the loop calls `beginStage` + `saveState` *before* invoking
 the agent, then `finishStage(stage, "success" | "failure")` + `saveState`
@@ -105,9 +113,13 @@ Halts print `Run halted: <message>` rather than a stack dump; set
 
 ### Safety rails
 
-- **Per-stage budget cap** (`MAX_BUDGET_USD_PER_STAGE`, default $2.00): passed
+- **Per-stage budget cap** (`MAX_BUDGET_USD_PER_STAGE`, default $4.00): passed
   as the SDK's `maxBudgetUsd`. An `error_max_budget_usd` result is treated as
-  an ordinary stage failure, not a crash.
+  an ordinary stage failure, not a crash. Raised from $2.00 in Phase 3: the
+  live Phase 2 stages cost ~$0.76 each, and `low-level-design` has to spec
+  every module in `docs/implementer.md`, so its output — and the context
+  accumulated across its write turns — is several times larger than any stage
+  measured so far.
 - **`permissionMode: 'bypassPermissions'`**: the pipeline is non-interactive,
   so a prompting mode would hang forever with nobody to answer it. The actual
   blast-radius control is each agent's `tools` allowlist from its frontmatter
@@ -168,15 +180,29 @@ noting who writes it and who reads it next.
   `product-understanding -> product-alignment -> deep-discovery`, with the
   orchestrator's control loop actually calling `runStage` and persisting state
   between them.
-- **Phase 2 (built, not yet run live):** the three planning stages —
+- **Phase 2 (done, verified live):** the three planning stages —
   `design-planning -> architecture-planning -> implementation-planning` — plus
   `docs/design.md` as design-planning's own artifact and `REQ-` ID
   traceability across all three.
-- **Phase 3+:** extend real invocation to the remaining stages (`system-design`
-  through `testing-agent`), implement `feedback-router`'s SDK call and output
-  parsing against the `FeedbackRouterDecision` type, wire `critic` for
-  on-demand use, and add the Playwright MCP tools referenced as a placeholder
-  in `agents/testing-agent.md`.
+- **Phase 3 (built, not yet run live):** the two design stages —
+  `system-design -> low-level-design`, producing `docs/hld.md` and
+  `docs/lld.md` — extending the traceability chain onto the `M` module IDs from
+  `docs/implementer.md`. Both are document stages, the same shape as Phase 2's.
+- **Phase 4+:** `spec-implementer`, then `reviewer` and `testing-agent`, then
+  `feedback-router`'s SDK call and output parsing against the
+  `FeedbackRouterDecision` type, `critic` wired for on-demand use, and the
+  Playwright MCP tools referenced as a placeholder in
+  `agents/testing-agent.md`.
+
+  `spec-implementer` is deliberately *not* in Phase 3. It writes real code with
+  `Bash`, and this orchestrator has no permission model for that: under
+  `permissionMode: 'bypassPermissions'`, `cwd` is a working directory, not a
+  boundary, so a code-writing agent needs a `canUseTool` callback or a
+  PreToolUse deny-list first. It is also an orchestrator refactor rather than a
+  stage addition — `StageIo.writes` is a single string, `hasRealContent()` is
+  the only verifier, and the budget cap is per-`query()` with no cumulative run
+  cap. And its input contract cannot be written honestly until `docs/hld.md`
+  and `docs/lld.md` exist for real.
 
 ## Layout
 

@@ -1,10 +1,14 @@
 // orchestrator/run.ts
 //
-// Phase 2: the first six stages run for real against the Claude Agent SDK.
+// Phase 3: the first eight stages run for real against the Claude Agent SDK.
 //   product-understanding -> product-alignment -> deep-discovery ->
-//   design-planning -> architecture-planning -> implementation-planning
-// Everything past implementation-planning is still stubbed (see STAGE_IO
-// below), as are feedback-router and critic.
+//   design-planning -> architecture-planning -> implementation-planning ->
+//   system-design -> low-level-design
+// Everything past low-level-design is still stubbed (see STAGE_IO below), as
+// are feedback-router and critic. spec-implementer in particular is deferred
+// on purpose: it writes real code with Bash, which needs a permission model
+// (a canUseTool/PreToolUse deny-list) that this orchestrator does not have —
+// `cwd` is not a boundary under bypassPermissions.
 
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -35,14 +39,21 @@ const PERMISSION_MODE: PermissionMode = "bypassPermissions";
  * Per-stage spend cap. An autonomous pipeline that web-searches can burn real
  * money; the SDK returns an `error_max_budget_usd` result instead of running
  * away, which we treat as an ordinary stage failure.
+ *
+ * Raised from $2.00 for Phase 3. The live Phase 2 run cost ~$0.76 per stage
+ * for documents of ~6-11k output tokens. low-level-design has to produce
+ * implementation-ready specs for up to 36 modules — several times that output,
+ * across several write turns whose context accumulates — so $2.00 was a cap a
+ * healthy run could plausibly hit. $4.00 keeps the runaway protection while
+ * leaving the largest expected stage room to finish.
  */
-const MAX_BUDGET_USD_PER_STAGE = 2.0;
+const MAX_BUDGET_USD_PER_STAGE = 4.0;
 
 /** The phase this build implements, used only for console/error wording. */
-const CURRENT_PHASE = 2;
+const CURRENT_PHASE = 3;
 
-/** Phase 2 stops here; the later stages have no STAGE_IO entry yet. */
-const LAST_IMPLEMENTED_STAGE: PipelineStage = "implementation-planning";
+/** Phase 3 stops here; the later stages have no STAGE_IO entry yet. */
+const LAST_IMPLEMENTED_STAGE: PipelineStage = "low-level-design";
 
 /** Where the raw product idea is persisted so re-runs and agents can see it. */
 const IDEA_DOC = "docs/idea.md";
@@ -81,6 +92,14 @@ const STAGE_IO: Partial<Record<PipelineStage, StageIo>> = {
   "implementation-planning": {
     reads: ["docs/design.md", "docs/architecture.md"],
     writes: "docs/implementer.md",
+  },
+  "system-design": {
+    reads: ["docs/design.md", "docs/architecture.md", "docs/implementer.md"],
+    writes: "docs/hld.md",
+  },
+  "low-level-design": {
+    reads: ["docs/implementer.md", "docs/hld.md"],
+    writes: "docs/lld.md",
   },
 };
 

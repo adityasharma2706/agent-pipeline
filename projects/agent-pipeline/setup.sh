@@ -18,11 +18,11 @@ DOC_HEADERS=(
   "product_understanding.md|<!-- Written by: product-understanding stage. Read by: product-alignment, deep-discovery, reviewer. -->"
   "classification.md|<!-- Written by: product-alignment stage. Read by: deep-discovery, architecture-planning. -->"
   "okf.md|<!-- Written by: deep-discovery stage (organized knowledge file). Read by: design-planning, architecture-planning. -->"
-  "design.md|<!-- Written by: design-planning stage. Read by: architecture-planning, implementation-planning. -->"
-  "architecture.md|<!-- Written by: architecture-planning stage. Read by: implementation-planning. -->"
+  "design.md|<!-- Written by: design-planning stage. Read by: architecture-planning, implementation-planning, system-design. -->"
+  "architecture.md|<!-- Written by: architecture-planning stage. Read by: implementation-planning, system-design. -->"
   "hld.md|<!-- Written by: system-design stage (high-level design). Read by: low-level-design. -->"
   "lld.md|<!-- Written by: low-level-design stage. Read by: spec-implementer. -->"
-  "implementer.md|<!-- Written by: implementation-planning stage (module list) and appended to by spec-implementer (progress log). Read by: system-design, spec-implementer. -->"
+  "implementer.md|<!-- Written by: implementation-planning stage (module list) and appended to by spec-implementer (progress log). Read by: system-design, low-level-design, spec-implementer. -->"
   "feedback_log.md|<!-- Written by: reviewer and testing-agent stages. Read by: feedback-router. -->"
 )
 
