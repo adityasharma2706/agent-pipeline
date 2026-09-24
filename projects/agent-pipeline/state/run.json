@@ -1,5 +1,24 @@
 {
-  "stage": null,
-  "history": [],
+  "stage": "deep-discovery",
+  "history": [
+    {
+      "stage": "product-understanding",
+      "startedAt": "2026-09-24T11:58:03.688Z",
+      "finishedAt": "2026-09-24T11:59:03.029Z",
+      "outcome": "success"
+    },
+    {
+      "stage": "product-alignment",
+      "startedAt": "2026-09-24T11:59:03.030Z",
+      "finishedAt": "2026-09-24T12:00:46.233Z",
+      "outcome": "success"
+    },
+    {
+      "stage": "deep-discovery",
+      "startedAt": "2026-09-24T12:00:46.234Z",
+      "finishedAt": "2026-09-24T12:06:46.017Z",
+      "outcome": "success"
+    }
+  ],
   "retries": {}
 }
