@@ -5,15 +5,22 @@ A multi-agent product-development pipeline built on the Claude Agent SDK
 research, classification, design, architecture, implementation, and review,
 with a feedback-router able to send work back to any earlier stage.
 
-**Phase 4 (current state):** the first nine stages are wired to run for real
-against the Claude Agent SDK — `product-understanding -> product-alignment ->
-deep-discovery -> design-planning -> architecture-planning ->
-implementation-planning -> system-design -> low-level-design ->
-spec-implementer`. The first eight write one design document each; the ninth
-writes real code, one module at a time, into a workspace outside this
-repository. The remaining two stages (`reviewer`, `testing-agent`), plus
-`invokeFeedbackRouter()` and `invokeCritic()`, are still stubs and throw if
-reached.
+**Phase 5 (current state): the pipeline stops being a line and becomes a
+loop.** Ten stages run for real against the Claude Agent SDK —
+`product-understanding -> product-alignment -> deep-discovery ->
+design-planning -> architecture-planning -> implementation-planning ->
+system-design -> low-level-design -> spec-implementer -> reviewer`. Eight write
+one design document each; `spec-implementer` writes real code, one module at a
+time, into a workspace outside this repository; `reviewer` reads that code
+alongside the design docs and writes evidence-bearing findings.
+
+Reaching `reviewer` is no longer the end of a run. `feedback-router` then reads
+those findings and returns routing decisions as SDK **structured output**, and
+a high-confidence decision sends execution **back** to an earlier stage, which
+then re-runs forward from there. `critic` is implemented but **on demand only**
+(`--critic <target>`) — it is never scheduled and never wired into the loop.
+`testing-agent` is the one stage still unimplemented, and it is blocked on a
+dependency rather than merely unscheduled (see below).
 
 `spec-implementer` is the first stage that is not a document stage, and it
 forced four generalisations in `orchestrator/run.ts`. Each is a widened type,
@@ -42,22 +49,39 @@ because requirement omission is the biggest measured weakness of agentic build
 pipelines (`docs/okf.md` §0.5, §6) — traceability is what makes an omission
 visible instead of silent.
 
-> **Phases 1-3 verified live; Phase 4 not yet.** Phase 1's three stages have
-> run against the live API end to end (~$1.85), Phase 2's three planning stages
-> have too (~$2.28, 17 turns, resumed from Phase 1's state), and Phase 3's two
-> design stages produced the `docs/hld.md` and `docs/lld.md` on disk. Phase 4's
-> `spec-implementer` has *not* been run live yet — no module has been built by
-> the real API, and no cost figure for it exists.
+> **Phases 1-3 verified live; Phases 4 and 5 not yet.** Phase 1's three stages
+> have run against the live API end to end (~$1.85), Phase 2's three planning
+> stages have too (~$2.28, 17 turns, resumed from Phase 1's state), and Phase
+> 3's two design stages produced the `docs/hld.md` and `docs/lld.md` on disk.
+> Phase 4's `spec-implementer` has *not* been run live — no module has been
+> built by the real API. Phase 5's `reviewer`, `feedback-router` and `critic`
+> have *not* been run live either: no real routing decision exists, and there
+> is no cost figure for a go-back.
 >
 > What *has* been verified without spending money: `tsc --noEmit`, the no-idea
 > usage path, resuming mid-pipeline, the already-complete path, rejection of a
 > malformed `state/run.json`, the config-fault halt (missing
-> `agents/<stage>.md`), and — for Phase 4 specifically — module parsing against
-> the real `docs/implementer.md` (36 modules, none hardcoded), idempotent
-> workspace bootstrap, the TS2307-vs-error classifier, the typecheck verifier
-> against hand-written good and broken files, every stub-detector rule, the
-> REQ-subset check, progress-log round-tripping and resume, and the cumulative
-> budget halting before it starts a call it cannot pay for.
+> `agents/<stage>.md`); for Phase 4, module parsing against the real
+> `docs/implementer.md` (36 modules, none hardcoded), idempotent workspace
+> bootstrap, the TS2307-vs-error classifier, the typecheck verifier against
+> hand-written good and broken files, every stub-detector rule, the REQ-subset
+> check, progress-log round-tripping and resume, and the cumulative budget
+> halting before it starts a call it cannot pay for; and for Phase 5, 78
+> assertions over the router and the go-back machinery — sixteen malformed
+> `structured_output` shapes each rejected as a clean error, every one of the
+> five escalation reasons, the gate's ordering, `planDrain`'s earliest-target
+> ordering and one-per-drain rule, a simulated run in which exactly three
+> go-backs are enacted and the fourth is refused with `cap-reached`, routing-log
+> round-tripping with `RD-n` allocation and corrupt-line tolerance, and
+> `goBacksUsed` validation including backwards compatibility with state files
+> written before Phase 5.
+>
+> Those checks run from a scratchpad copy of the project against
+> `orchestrator/router.ts`, `routing.ts` and `state.ts` only — none of which has
+> an import path to `query()`, so the verification cannot make a billable call
+> even by mistake. That is deliberate: `docs/idea.md` is populated and
+> `state/run.json` is mid-pipeline, so a bare `npm run orchestrator` in this
+> repo spends money immediately.
 
 ## Setup
 
@@ -93,11 +117,10 @@ argument and the orchestrator will pick it up from there. With neither an
 argument nor a non-empty `docs/idea.md`, it prints usage and exits 1 without
 making any API calls.
 
-Phase 4 runs `product-understanding -> product-alignment -> deep-discovery ->
-design-planning -> architecture-planning -> implementation-planning ->
-system-design -> low-level-design -> spec-implementer` and then stops at the
-`LAST_IMPLEMENTED_STAGE` constant in `orchestrator/run.ts`. Per-stage and
-cumulative USD cost are logged.
+Phase 5 runs `product-understanding -> ... -> spec-implementer -> reviewer`,
+then drains the `feedback-router`, then either goes back to an earlier stage and
+re-runs forward from there, or stops. Per-stage and cumulative USD cost are
+logged.
 
 **`--max-modules N`** (default **2**) caps how many modules `spec-implementer`
 builds in one invocation:
@@ -110,8 +133,13 @@ The default is deliberately tiny — the first live run of a loop that writes re
 code should be cheap enough to throw away, and raising it is a decision you make
 on purpose. It is a cap, not a truncation: modules recorded as complete in the
 workspace progress log are skipped, so re-running continues where the last run
-stopped rather than rebuilding. It is the only flag; anything else starting with
-`--` is rejected rather than silently written into `docs/idea.md`.
+stopped rather than rebuilding.
+
+**`--max-go-backs N`** (default **3**) caps how many times one run may send
+execution back to an earlier stage. **`--critic <target>`** runs a single
+on-demand critic session and nothing else. Those three are the only flags;
+anything else starting with `--` is rejected rather than silently written into
+`docs/idea.md`.
 
 Around each stage the loop calls `beginStage` + `saveState` *before* invoking
 the agent, then `finishStage(stage, outcome)` + `saveState` after. So
@@ -211,7 +239,9 @@ around on the agent side:
 - **The agent cannot verify its own work.** So the orchestrator runs the
   typecheck itself. Success is never the agent's self-report.
 - **`testing-agent` cannot ship before M18.** It needs Playwright, i.e. a
-  shell. It stays unimplemented, as does `reviewer`.
+  shell. It stays unimplemented — see *Why `testing-agent` is still
+  unimplemented* below. (`reviewer` ships in Phase 5: it only needs to *read*
+  the code, not run it.)
 
 **Where the code goes.** Generated code is written *outside this git repo*, to
 `~/agent-pipeline-workspace` by default, overridable with the
@@ -294,6 +324,152 @@ like successes: a module that failed honestly and said why is more useful than
 one that quietly stubbed. It is also the resume ledger, which is what makes
 `--max-modules` a resumable cap rather than a truncation.
 
+### The feedback loop (reviewer -> feedback-router -> go-back)
+
+This is the part that makes the pipeline a loop rather than a line, and it is
+the product's actual differentiator.
+
+**`reviewer`** is a document stage with an unusual shape: `cwd` is the project
+(so it writes `docs/feedback_log.md` in place) but the generated code lives in a
+workspace outside this repo, granted read-only through the SDK's
+`additionalDirectories`. Its tools are `Read, Write, Grep, Glob` — no `Bash`, so
+it reads the code it is reviewing and cannot run it. It reviews two things:
+whether the implementation matches *intent* (`REQ-NNN` coverage) and whether the
+code quality is sound.
+
+Every finding it writes must carry a stable id (`F-1`, `F-2`, ...), a severity,
+and **the evidence it rests on** — a `file:line`, a `REQ-NNN`, or an `Mnn`.
+That last requirement is not stylistic. The router's accuracy is bounded by the
+quality of the evidence it is handed, and a routing decision is an instruction
+to spend money re-running stages.
+
+**`feedback-router`** reads `docs/feedback_log.md` and returns its decisions as
+SDK **structured output** (`options.outputFormat` with a `json_schema`; the
+result arrives on `SDKResultSuccess.structured_output`). Nothing is scraped out
+of prose and there is no regex fallback — a fallback would mean the malformed
+case silently produces *something*. `structured_output` is typed `unknown` by
+the SDK, so it is validated field by field at runtime anyway
+(`parseRouterDecisions`); a malformed decision set is a clean, named failure
+that halts the loop, never a crash and never a half-trusted object. `RD-n` ids
+are allocated by the orchestrator from the routing log, not by the agent.
+
+#### Confidence gating, and why it is not optional
+
+**Only `high` confidence auto-routes.** `medium` and `low` both halt and report
+for a human with escalation reason `low-confidence`.
+
+This is evidence-based, not caution for its own sake, and the evidence is in
+this pipeline's own research file. `docs/okf.md` §3.1 records that automated
+failure attribution — "which stage is responsible for this failure?" — is an
+open research problem: on the **Who&When** benchmark (ICML 2025 spotlight,
+arXiv 2505.00212, failure logs from 127 multi-agent systems) the *best* method
+identifies the responsible agent **53.5%** of the time, and some methods score
+below random; **AgenTracer** (ICLR 2026, arXiv 2509.03312), a model purpose-
+trained for attribution, reaches about **69%**. A router that trusts its own
+attribution unconditionally is therefore wrong something like a third to a half
+of the time, and *every wrong answer burns a full re-run of the target stage and
+everything downstream of it*. That makes wrong attribution the most expensive
+error available in this system.
+
+The threshold is also the pipeline's own generated design:
+`router.autoProceedMinConfidence: 'high'` in `docs/lld.md` §M01 defaults.
+`docs/lld.md` §M27 gate step 6 permits `medium` to *ask the user* when a run is
+attended; this orchestrator has no attended mode — there is nobody sitting at
+the process to answer — and §M27 says plainly that "`ask-user` in unattended
+mode always becomes escalate". So medium escalating is that rule applied, not a
+departure from it.
+
+#### What a go-back actually costs
+
+Enacting a decision **re-runs the target stage and every stage downstream of it,
+each at full price**. It is not a patch applied to one document. This is the
+same tradeoff LangGraph's checkpoint time-travel makes — `docs/okf.md` §6.3:
+"Everything after that point runs again, including model calls. Replay is a
+re-run of the tail, not a recording of it." Selective invalidation (rebuild only
+what is downstream of a changed input, Make/Bazel style) is the alternative that
+section names, and it is **not implemented here**. That is a known, chosen
+limitation rather than an oversight, and it is exactly why the gate is strict.
+
+#### The guards, all of them real
+
+| Guard | Escalation reason | Behaviour |
+|---|---|---|
+| Target has no implementation in this build | `guard-violation` | Refused. Enacting it would spend a go-back on a stage that cannot run. |
+| Target is at or after the origin stage | `contract-violation` | Refused. A "go-back" that goes forward is a contradiction; the feedback was produced *by* the origin stage. |
+| `goBacksUsed >= maxGoBacksPerRun` (default **3**) | `cap-reached` | Refused. The counter lives in `state/run.json` and survives restarts. |
+| Forecast cost > remaining run budget | `budget-insufficient` | Refused *before starting*, so a go-back never begins and dies halfway with the money spent. |
+| Confidence below `high` | `low-confidence` | Refused, reported for a human. |
+
+The two structural checks are hoisted above the caps, which is a deliberate
+departure from `docs/lld.md` §M27's ordering: reporting a malformed decision as
+"out of budget" would send a human to look at the wrong thing.
+
+When a decision *is* enacted, `state.stage` is rewound to just before the target
+**before** the re-run starts (so a crash mid-go-back resumes at the target
+rather than skipping it), and the retry counters for the target and everything
+after it are cleared — a stage that failed twice earlier in the run should not
+get one attempt at a fresh input. The loop guard for go-backs is
+`maxGoBacksPerRun`, not a leftover retry count.
+
+Exactly **one** decision is enacted per drain (`docs/lld.md` §M28: "one issue
+enacted per drain"), the one with the earliest target, because going back
+furthest subsumes every nearer target in the same pass. The rest are recorded as
+`deferred`, not judged: the go-back ends by re-running the reviewer, which
+re-derives the findings from what is then true.
+
+#### The routing log
+
+Every routing decision is appended to **`state/routing.jsonl`** — id, origin,
+target, reason, priority, confidence and the router's stated reason for it, the
+evidence, the finding ids, the gate rule that judged it, whether it was enacted,
+the outcome, the cost estimate and the budget remaining at the time.
+
+`docs/okf.md` §3.5 asks, as an open question, "Should routing decisions be
+logged as data, so their accuracy can be measured over time?" This is the answer
+being yes. **Rejected and deferred decisions are logged too**, which is the
+whole point: measuring a ~53-69% accuracy rate needs the entire sample, not just
+the decisions that already cleared the confidence filter. The file is JSONL and
+append-only, and lives in `state/` rather than `docs/` because `docs/` is
+stage-artifact territory while this is orchestrator bookkeeping about the run.
+(`docs/lld.md` §M28 puts the equivalent at `.pipeline/routing.jsonl` — same
+separation, different directory name.)
+
+### The critic (on demand, never scheduled)
+
+```
+npm run orchestrator -- --critic docs/design.md
+npm run orchestrator -- --critic "the onboarding flow in the generated app"
+```
+
+`--critic` is a complete alternative to running the pipeline: no stage runs, no
+run state is touched, and `docs/idea.md` is not written. The critic applies a
+human lens — user experience, output quality, whether the work matches what a
+person actually *meant* rather than what the spec literally said. Conformance to
+the spec is already the reviewer's job.
+
+It is deliberately **not** auto-invoked and **not** wired into the loop above.
+That is the original framing of the agent ("invoked independently whenever a
+critical lens is needed") and it is also what the generated plan says:
+auto-invoking the critic is **M33**, a "Could" item, i.e. explicitly a later
+feature. An agent that runs on every pass costs money on every pass whether or
+not anyone wanted its opinion.
+
+The critic has `Read, Grep, Glob` and **no Write**: it reports in its final
+message and the *orchestrator* records the session into `docs/critic_log.md`
+under a monotonic `C-n` id. That is what keeps it invokable from any context
+rather than tied to one fixed pipeline document.
+
+### Why `testing-agent` is still unimplemented
+
+It is blocked on a dependency, not merely unscheduled, and the error says so
+rather than "not implemented". `testing-agent` runs end-to-end tests via
+Playwright, which needs a shell. **Decision LD-1** in `docs/lld.md` (line ~396)
+requires *all* command execution to go through a custom `sandbox_exec` MCP tool
+built with `createSdkMcpServer`, and to **never enable native Bash**. That
+sandbox is module **M18** and has not been built. Giving `testing-agent` Bash
+instead would violate the pipeline's own generated design, so it stays
+unimplemented until M18 ships.
+
 ### Isolation and prompt caching
 
 `settingSources: []` is passed on every `query()` call — SDK isolation mode.
@@ -329,8 +505,9 @@ testing-agent
 `orchestrator/run.ts`; critic is invoked on demand by the orchestrator or by
 any other agent, on no fixed schedule.
 
-`reviewer` is a human checkpoint in v1 — the orchestrator is expected to
-pause there for human approval before feedback-router acts.
+`reviewer` is a human checkpoint in v1 — nothing it finds is auto-applied, and
+only *high-confidence* routing decisions derived from it are acted on without a
+human.
 
 Each stage's subagent definition lives in `agents/<stage-name>.md` (YAML
 frontmatter + system prompt, same shape as `.claude/agents/*.md`). Each
@@ -361,12 +538,20 @@ noting who writes it and who reads it next.
   out-of-repo workspace, the `docs/implementer.md` module parser, the four-check
   per-module verifier, the workspace progress log, and `--max-modules`. See
   *The spec-implementer stage* above.
-- **Phase 5+:** `reviewer`, then the sandbox executor (**M18**) and only then
-  `testing-agent`, which needs Playwright and therefore a shell. After that,
-  `feedback-router`'s SDK call and output parsing against the
-  `FeedbackRouterDecision` type, and `critic` wired for on-demand use.
+- **Phase 5 (built, not yet run live):** the feedback loop — `reviewer`,
+  `feedback-router` with structured output and confidence gating, the go-back
+  loop with real caps, the routing log, and `critic` on demand. See *The
+  feedback loop* above.
+- **Phase 6+:** the sandbox executor (**M18**), and only then `testing-agent`,
+  which needs Playwright and therefore a shell. Selective invalidation, so a
+  go-back rebuilds only what is actually downstream of the changed input rather
+  than re-running the whole tail. Per-stage cost history in `state/run.json`, so
+  the go-back estimate can use a real median instead of a flat $1.00 guess.
+  Stale-marking of already-built modules when an upstream design doc changes
+  (`docs/lld.md` §M28), without which `spec-implementer` skips its way through a
+  go-back. Auto-invoked critic (**M33**, a "Could" item).
 
-  The permission model is the known gap carried into Phase 5. Under
+  The permission model is the known gap carried forward. Under
   `permissionMode: 'bypassPermissions'`, `cwd` is a working directory, not a
   boundary, and `additionalDirectories` grants `docs/` to `spec-implementer` by
   instruction rather than by enforcement. Removing `Bash` shrinks the blast
@@ -382,13 +567,19 @@ agent-pipeline/
   docs/            pipeline doc artifacts, written/read stage to stage
                    (docs/idea.md is the human-supplied input)
   state/run.json   persisted orchestrator state
-  orchestrator/    run.ts (control loop + runStage), agent-loader.ts,
-                   types.ts, state.ts, and the Phase 4 additions:
+  state/routing.jsonl  every routing decision, enacted or not (Phase 5)
+  orchestrator/    run.ts (control loop + runStage + the go-back loop),
+                   agent-loader.ts, types.ts, state.ts, and:
                    budget.ts    cumulative run budget
                    modules.ts   docs/implementer.md module parser
                    workspace.ts workspace bootstrap, snapshots, typecheck
                    verify.ts    per-module verification + stub detection
                    progress.ts  the workspace progress log / resume ledger
+                   router.ts    the router contract: output schema, runtime
+                                validation, the confidence gate, planDrain.
+                                PURE — no SDK import, so the gate can be
+                                exercised without a billable call.
+                   routing.ts   the append-only routing log + RD-n allocation
   setup.sh         idempotent bootstrap
 ```
 

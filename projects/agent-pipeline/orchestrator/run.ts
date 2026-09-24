@@ -1,16 +1,34 @@
 // orchestrator/run.ts
 //
-// Phase 4: the first nine stages run for real against the Claude Agent SDK.
+// Phase 5: the pipeline stops being a line and becomes a loop.
+//
 //   product-understanding -> product-alignment -> deep-discovery ->
 //   design-planning -> architecture-planning -> implementation-planning ->
-//   system-design -> low-level-design -> spec-implementer
-// Everything past spec-implementer is still stubbed (see STAGE_IO below), as
-// are feedback-router and critic. testing-agent in particular cannot ship
-// before the sandbox (module M18) exists: it needs Playwright, i.e. a shell.
+//   system-design -> low-level-design -> spec-implementer -> reviewer
+//                                                              |
+//                              feedback-router reads reviewer's findings and
+//                              may send execution BACK to any earlier stage.
 //
-// spec-implementer is the first stage that is not a document stage, and it
-// broke four assumptions this file used to make. Each is now generalised rather
-// than special-cased on the stage name:
+// Three things arrive with this phase:
+//   1. `reviewer` — a document stage that reads the generated code as well as
+//      the design docs, and writes evidence-bearing findings (F-n).
+//   2. `feedback-router` — returns routing decisions as SDK STRUCTURED OUTPUT,
+//      gated on confidence before any of them is allowed to spend money. See
+//      orchestrator/router.ts for the gate and the research behind it.
+//   3. the go-back loop below, with real caps: maxGoBacksPerRun, the cumulative
+//      run budget, and a hard refusal to ever route forward.
+//
+// `critic` is implemented but is ON DEMAND ONLY (`--critic <target>`) and is
+// deliberately not wired into this loop — auto-invoking it on a schedule is a
+// later "Could" feature (M33) in the generated plan, not this phase.
+//
+// testing-agent is still unimplemented, and cannot ship before the sandbox
+// (module M18) exists: it needs Playwright, i.e. a shell, and Decision LD-1
+// forbids native Bash. See NOT_IMPLEMENTED_REASONS.
+//
+// spec-implementer (Phase 4) is the first stage that is not a document stage,
+// and it broke four assumptions this file used to make. Each is generalised
+// rather than special-cased on the stage name:
 //   1. a stage wrote ONE document      -> StageIo.writes is a StageOutput union
 //   2. hasRealContent() was the verifier -> per-output-kind verification
 //   3. cwd was always PROJECT_ROOT     -> StageIo.cwd is "project" | "workspace"
@@ -31,12 +49,29 @@ import {
   saveState,
   beginStage,
   finishStage,
+  goBacksUsed,
+  recordGoBack,
   recordRetry,
+  rewindTo,
   MAX_RETRIES_PER_STAGE,
 } from "./state.js";
 import { PROJECT_ROOT, loadAgentDefinition } from "./agent-loader.js";
 import { PIPELINE_STAGES } from "./types.js";
-import type { PipelineStage, FeedbackRouterDecision, RunState, StageOutcome } from "./types.js";
+import type {
+  AgentName,
+  PipelineStage,
+  FeedbackRouterDecision,
+  RoutingLogEntry,
+  RunState,
+  StageOutcome,
+} from "./types.js";
+import {
+  DEFAULT_MAX_GO_BACKS_PER_RUN,
+  ROUTER_OUTPUT_SCHEMA,
+  parseRouterDecisions,
+  planDrain,
+} from "./router.js";
+import { appendRoutingEntry, loadRoutingLog, nextRoutingDecisionId, routingLogPath } from "./routing.js";
 import { MAX_BUDGET_USD_PER_RUN, RunBudget } from "./budget.js";
 import { loadModules } from "./modules.js";
 import type { ModuleSpec } from "./modules.js";
@@ -90,10 +125,51 @@ const MIN_BUDGET_HEADROOM_USD = 0.5;
 const DEFAULT_MAX_MODULES = 2;
 
 /** The phase this build implements, used only for console/error wording. */
-const CURRENT_PHASE = 4;
+const CURRENT_PHASE = 5;
 
-/** Phase 4 stops here; the later stages have no STAGE_IO entry yet. */
-const LAST_IMPLEMENTED_STAGE: PipelineStage = "spec-implementer";
+/**
+ * The last stage in the linear order that this build can run. Reaching it
+ * successfully is what triggers the feedback loop, not the end of the run.
+ */
+const LAST_IMPLEMENTED_STAGE: PipelineStage = "reviewer";
+
+/**
+ * Why a stage is not implemented, where "not implemented yet" is not the real
+ * answer. Read by stageIo() so the error a human sees says what is actually
+ * blocking rather than just naming a phase number.
+ */
+const NOT_IMPLEMENTED_REASONS: Partial<Record<PipelineStage, string>> = {
+  "testing-agent":
+    'Stage "testing-agent" is blocked on module M18 (the sandbox executor), not merely unscheduled. ' +
+    "It runs end-to-end tests via Playwright, which needs a shell. Decision LD-1 in docs/lld.md " +
+    "(line ~396) requires ALL command execution to go through a custom `sandbox_exec` MCP tool " +
+    "created with createSdkMcpServer, and to NEVER enable native Bash. M18 is that tool and has " +
+    "not been built. Giving testing-agent Bash instead would violate the pipeline's own generated " +
+    "design, so it stays unimplemented until M18 ships.",
+};
+
+/**
+ * Where docs/feedback_log.md lives — reviewer writes it, feedback-router reads
+ * it, and nothing else touches it.
+ */
+const FEEDBACK_LOG_DOC = "docs/feedback_log.md";
+
+/** Where an on-demand critic session is recorded. Appended, never rewritten. */
+const CRITIC_LOG_DOC = "docs/critic_log.md";
+
+/**
+ * Coarse per-stage forecast used only by the go-back budget gate.
+ *
+ * It is a flat number rather than a model, and that is a deliberate choice over
+ * the alternative in docs/lld.md §M27 ("the median of historicalStageCost per
+ * stage times the stale fraction"): state/run.json does not record per-stage
+ * cost, so there is no history to take a median of yet. $1.00 is taken from the
+ * live figures in the README — Phase 1 cost ~$1.85 over three stages and Phase
+ * 2 ~$2.28 over three — rounded up, because a forecast that is too low lets the
+ * gate approve a go-back that dies partway through, which is the failure this
+ * gate exists to prevent.
+ */
+const GO_BACK_DOC_STAGE_ESTIMATE_USD = 1.0;
 
 /** Where the raw product idea is persisted so re-runs and agents can see it. */
 const IDEA_DOC = "docs/idea.md";
@@ -124,6 +200,13 @@ interface StageIo {
   reads: string[];
   writes: StageOutput;
   cwd: StageCwd;
+  /**
+   * Roots OTHER than `cwd` the stage needs to read, granted through the SDK's
+   * `additionalDirectories`. reviewer is the first document stage that needs
+   * one: it runs in the project (so it can write docs/feedback_log.md in
+   * place) but has to read code that lives in a workspace outside this repo.
+   */
+  grants?: StageCwd[];
 }
 
 /**
@@ -176,6 +259,16 @@ const STAGE_IO: Partial<Record<PipelineStage, StageIo>> = {
     writes: { kind: "workspace-modules", moduleDoc: IMPLEMENTER_DOC },
     cwd: "workspace",
   },
+  // reviewer is a document stage that reads code. cwd stays "project" so it
+  // writes docs/feedback_log.md in place; the workspace is granted read access
+  // separately. Its tools are Read/Write/Grep/Glob — no Bash, so it cannot run
+  // the code it is reviewing, only read it.
+  reviewer: {
+    reads: ["docs/design.md", IMPLEMENTER_DOC, "docs/lld.md"],
+    writes: { kind: "document", path: FEEDBACK_LOG_DOC },
+    cwd: "project",
+    grants: ["workspace"],
+  },
 };
 
 /** One line describing a stage's output, for the "already complete" report. */
@@ -198,19 +291,39 @@ function phaseForStage(stage: PipelineStage): number {
     : CURRENT_PHASE + 1;
 }
 
+/** Whether a stage can actually be run by this build. The router gate uses it. */
+function isImplemented(stage: PipelineStage): boolean {
+  return STAGE_IO[stage] !== undefined;
+}
+
 function stageIo(stage: PipelineStage): StageIo {
   const io = STAGE_IO[stage];
   if (io === undefined) {
+    // Prefer the specific reason when there is one — "not implemented until
+    // Phase 6+" is true of testing-agent but tells a human nothing about the
+    // dependency that is actually blocking it.
     throw new Error(
-      `Stage "${stage}" has no doc I/O mapping — not implemented until Phase ${phaseForStage(stage)}+.`
+      NOT_IMPLEMENTED_REASONS[stage] ??
+        `Stage "${stage}" has no doc I/O mapping — not implemented until Phase ${phaseForStage(stage)}+.`
     );
   }
   return io;
 }
 
+/** Resolves a StageCwd to an absolute directory. */
+function resolveRoot(where: StageCwd): string {
+  return where === "workspace" ? workspaceRoot() : PROJECT_ROOT;
+}
+
 /** Resolves StageIo.cwd to an absolute directory. */
 function resolveCwd(io: StageIo): string {
-  return io.cwd === "workspace" ? workspaceRoot() : PROJECT_ROOT;
+  return resolveRoot(io.cwd);
+}
+
+/** The absolute `additionalDirectories` a stage needs, or undefined for none. */
+function resolveGrants(io: StageIo): string[] | undefined {
+  if (io.grants === undefined || io.grants.length === 0) return undefined;
+  return io.grants.map(resolveRoot);
 }
 
 export interface StageResult {
@@ -258,9 +371,21 @@ function buildDocumentPrompt(stage: PipelineStage, io: StageIo, outputPath: stri
   // Volatile, run-specific instruction goes here in the `prompt` argument; the
   // stable system prompt comes from agents/<stage>.md. That ordering is what
   // keeps the cached prompt prefix stable across stages and re-runs.
+  // reviewer is the only document stage that also reads code, and the code is
+  // not under its cwd — it has to be told where the granted directory is.
+  const extra =
+    io.grants?.includes("workspace") === true
+      ? [
+          `The generated code you are reviewing is at ${workspaceRoot()} (granted read-only). ` +
+            `Use Glob and Grep there rather than reading the whole tree; it may be large, and ` +
+            `${workspaceRoot()}/PROGRESS.md lists which modules have actually been built so far.`,
+        ]
+      : [];
+
   return [
     `You are running as the "${stage}" stage of an automated product-development pipeline.`,
     reads,
+    ...extra,
     `Write your output to ${outputPath}, replacing any placeholder content but keeping the existing HTML comment header line at the top of the file.`,
     `The file must end up with substantive markdown content — an empty or header-only file counts as a failed stage.`,
     `Work autonomously: there is no human to ask, so record open questions and assumptions in your output rather than stopping to ask them.`,
@@ -310,6 +435,14 @@ interface QueryOutcome {
   text: string;
   costUsd: number;
   numTurns: number;
+  /**
+   * `SDKResultSuccess.structured_output`, passed through verbatim and still
+   * typed `unknown`. It is only populated when the call set `outputFormat`, and
+   * even then schema-constrained decoding is a strong constraint rather than a
+   * guarantee — so it is validated at the call site (parseRouterDecisions)
+   * rather than being trusted here.
+   */
+  structuredOutput: unknown;
 }
 
 /**
@@ -329,9 +462,19 @@ interface QueryOutcome {
 async function runQueryOnce(
   label: string,
   definition: AgentDefinition,
-  stageName: PipelineStage,
+  stageName: AgentName,
   prompt: string,
-  extra: { cwd: string; maxBudgetUsd: number; additionalDirectories?: string[] }
+  extra: {
+    cwd: string;
+    maxBudgetUsd: number;
+    additionalDirectories?: string[];
+    /**
+     * A JSON schema for structured output. Set only by the feedback-router
+     * call: its result is consumed programmatically to decide how to spend
+     * money, and scraping that out of prose is not an option.
+     */
+    outputSchema?: Record<string, unknown>;
+  }
 ): Promise<QueryOutcome> {
   const options: Options = {
     agent: stageName,
@@ -349,9 +492,18 @@ async function runQueryOnce(
   if (extra.additionalDirectories !== undefined) {
     options.additionalDirectories = extra.additionalDirectories;
   }
+  if (extra.outputSchema !== undefined) {
+    options.outputFormat = { type: "json_schema", schema: extra.outputSchema };
+  }
 
   const assistantText: string[] = [];
-  let outcome: QueryOutcome = { ok: false, text: "", costUsd: 0, numTurns: 0 };
+  let outcome: QueryOutcome = {
+    ok: false,
+    text: "",
+    costUsd: 0,
+    numTurns: 0,
+    structuredOutput: undefined,
+  };
   let sawResultMessage = false;
 
   try {
@@ -366,6 +518,7 @@ async function runQueryOnce(
         text: message.subtype === "success" ? message.result : assistantText.join("\n"),
         costUsd: message.total_cost_usd,
         numTurns: message.num_turns,
+        structuredOutput: message.subtype === "success" ? message.structured_output : undefined,
       };
       if (!ok) console.error(`  [${label}] SDK result was not a success: ${message.subtype}`);
     }
@@ -391,12 +544,22 @@ async function runDocumentStage(
   definition: AgentDefinition,
   budget: RunBudget
 ): Promise<StageResult> {
+  const additionalDirectories = resolveGrants(io);
+  // A granted directory that does not exist is rejected by the SDK, and the
+  // workspace legitimately may not exist yet on a run that reached reviewer
+  // without building anything. Bootstrapping is idempotent, so this is safe.
+  if (io.grants?.includes("workspace") === true) await ensureWorkspace();
+
   const outcome = await runQueryOnce(
     stageName,
     definition,
     stageName,
     buildDocumentPrompt(stageName, io, outputRelPath),
-    { cwd: resolveCwd(io), maxBudgetUsd: budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE) }
+    {
+      cwd: resolveCwd(io),
+      maxBudgetUsd: budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE),
+      ...(additionalDirectories !== undefined ? { additionalDirectories } : {}),
+    }
   );
   budget.record(outcome.costUsd);
 
@@ -597,27 +760,347 @@ async function runStage(
 }
 
 /**
- * Should read docs/feedback_log.md, invoke the feedback-router agent via the
- * SDK, and parse its output into a FeedbackRouterDecision[] that the control
- * loop can act on (i.e. re-run decision.target_stage through the control loop).
+ * What one drain of the feedback-router produced.
  *
- * TODO(later phase, once reviewer/testing-agent produce real feedback):
- * implement the SDK call and the output parsing/validation against the
- * FeedbackRouterDecision shape.
+ * `ok: false` with `decisions: []` is a clean failure, never a crash: the two
+ * ways this call goes wrong (the SDK call itself failed, or the structured
+ * output did not validate) both leave the run in a state where the only safe
+ * move is to stop and tell a human, and neither should take the process down.
  */
-function invokeFeedbackRouter(): never {
-  throw new Error("invokeFeedbackRouter() is not implemented yet — later phase.");
+interface RouterRunResult {
+  ok: boolean;
+  error: string | null;
+  decisions: FeedbackRouterDecision[];
+  costUsd: number;
+  numTurns: number;
 }
 
 /**
- * Should invoke the critic agent on demand (not on a fixed schedule) with
- * whatever artifact needs a critical/human-perspective lens.
+ * Reads docs/feedback_log.md and returns the router's decisions.
  *
- * TODO(later phase): implement the SDK call. Callers pass the artifact/context
- * to critique; critic reports back directly rather than writing a fixed doc.
+ * The decisions arrive as SDK STRUCTURED OUTPUT (`options.outputFormat` with a
+ * json_schema; the result lands on `SDKResultSuccess.structured_output`).
+ * Nothing is parsed out of prose here, and there is no regex fallback — a
+ * fallback would mean the malformed case silently produces *something*, and
+ * what this function returns is an instruction to spend money re-running
+ * stages. `structured_output` is typed `unknown` by the SDK and is validated
+ * against the expected shape by parseRouterDecisions() regardless.
+ *
+ * `RD-n` ids are allocated HERE, from the routing log, not by the agent
+ * (docs/lld.md §base: monotonic per project, max existing id + 1).
  */
-function invokeCritic(_targetDescription: string): never {
-  throw new Error("invokeCritic() is not implemented yet — later phase.");
+async function invokeFeedbackRouter(
+  budget: RunBudget,
+  originStage: PipelineStage
+): Promise<RouterRunResult> {
+  const definition = await loadAgentDefinition("feedback-router");
+
+  const prompt = [
+    `You are the feedback-router for an automated product-development pipeline.`,
+    `Read ${FEEDBACK_LOG_DOC} (relative to the current working directory). It holds the findings ` +
+      `written by the "${originStage}" stage, each with an F-n id, a severity and its evidence.`,
+    `The feedback was produced BY the "${originStage}" stage, so every target_stage you name must ` +
+      `be EARLIER than "${originStage}" in the pipeline order. A decision naming "${originStage}" ` +
+      `or anything after it is rejected as a contract violation and wastes the call.`,
+    `Check each finding's evidence against the upstream documents before you rate your confidence ` +
+      `in it — you have Read and Grep for exactly that.`,
+    `Return your decisions as structured output matching the schema you were given. Emit no ` +
+      `decision at all for findings that do not warrant re-running a stage; an empty array is a ` +
+      `valid answer.`,
+  ].join("\n\n");
+
+  const outcome = await runQueryOnce("feedback-router", definition, "feedback-router", prompt, {
+    cwd: PROJECT_ROOT,
+    maxBudgetUsd: budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE),
+    outputSchema: ROUTER_OUTPUT_SCHEMA,
+  });
+  budget.record(outcome.costUsd);
+
+  const base = { costUsd: outcome.costUsd, numTurns: outcome.numTurns, decisions: [] };
+  if (!outcome.ok) {
+    return { ...base, ok: false, error: `the feedback-router call failed: ${outcome.text.slice(0, 300)}` };
+  }
+
+  const parsed = parseRouterDecisions(outcome.structuredOutput);
+  if (!parsed.ok) {
+    return {
+      ...base,
+      ok: false,
+      error: `the feedback-router returned a malformed decision set — ${parsed.error}`,
+    };
+  }
+
+  const log = await loadRoutingLog();
+  let counter = Number(nextRoutingDecisionId(log).slice(3));
+  const decisions: FeedbackRouterDecision[] = parsed.decisions.map((decision) => {
+    const id = `RD-${counter}`;
+    counter += 1;
+    return { id, ...decision };
+  });
+
+  return { ...base, ok: true, error: null, decisions };
+}
+
+/**
+ * Forecast cost of re-running the pipeline from `target` through the last
+ * implemented stage. Coarse by design — see GO_BACK_DOC_STAGE_ESTIMATE_USD.
+ *
+ * Known soft spot, stated rather than hidden: spec-implementer's re-run skips
+ * modules already recorded complete in the workspace progress log, so its real
+ * re-run cost is far lower than one stage cap unless that log is cleared. This
+ * orchestrator does not yet invalidate built modules when an upstream design
+ * doc changes (docs/lld.md §M28's "mark the stale items" step is not
+ * implemented), so the estimate is deliberately the pessimistic one.
+ */
+function estimateGoBackUsd(target: PipelineStage): number {
+  const from = PIPELINE_STAGES.indexOf(target);
+  const to = PIPELINE_STAGES.indexOf(LAST_IMPLEMENTED_STAGE);
+  let total = 0;
+  for (let i = from; i <= to; i += 1) {
+    const stage = PIPELINE_STAGES[i];
+    if (stage === undefined) continue;
+    const io = STAGE_IO[stage];
+    if (io === undefined) continue;
+    total += io.writes.kind === "document" ? GO_BACK_DOC_STAGE_ESTIMATE_USD : MAX_BUDGET_USD_PER_STAGE;
+  }
+  return total;
+}
+
+/** Which stages a go-back to `target` would re-run, for the console report. */
+function stagesRerunBy(target: PipelineStage): PipelineStage[] {
+  const from = PIPELINE_STAGES.indexOf(target);
+  const to = PIPELINE_STAGES.indexOf(LAST_IMPLEMENTED_STAGE);
+  return PIPELINE_STAGES.slice(from, to + 1).filter(isImplemented);
+}
+
+interface FeedbackLoopResult {
+  state: RunState;
+  /** The stage to resume at, or null to stop the run. */
+  nextStage: PipelineStage | null;
+}
+
+/**
+ * The go-back loop. Runs after `originStage` (reviewer) completes successfully.
+ *
+ * WHAT ENACTING A DECISION ACTUALLY COSTS, stated plainly because it is easy to
+ * read "go back to design-planning" as cheap: the pipeline re-runs from the
+ * target stage FORWARD THROUGH EVERY DOWNSTREAM STAGE, each at full price. It
+ * is not a patch applied to one document. This is the same tradeoff LangGraph's
+ * checkpoint time-travel makes — docs/okf.md §6.3: "Everything after that point
+ * runs again, including model calls. Replay is a re-run of the tail, not a
+ * recording of it." Selective invalidation (rebuild only what is downstream of
+ * a changed input, Make/Bazel style) is the alternative that section names, and
+ * it is not implemented here. That is a known, chosen limitation, not an
+ * oversight — and it is precisely why the gate below is strict.
+ *
+ * Exactly ONE decision is enacted per drain (docs/lld.md §M28: "one issue
+ * enacted per drain"), the one with the earliest target, because re-running
+ * from the earliest stage re-runs the later targets anyway. The remaining
+ * decisions are logged as `deferred`: the go-back re-runs the reviewer at the
+ * end, which produces fresh findings, and the router judges the situation again
+ * from what is then true rather than from a stale queue.
+ */
+async function driveFeedbackLoop(
+  state0: RunState,
+  budget: RunBudget,
+  originStage: PipelineStage,
+  maxGoBacksPerRun: number
+): Promise<FeedbackLoopResult> {
+  let state = state0;
+
+  console.log("");
+  console.log("==> feedback-router");
+  if (!budget.canAfford(MIN_BUDGET_HEADROOM_USD)) {
+    console.log(
+      `    skipped — only $${budget.remaining.toFixed(4)} left of $${budget.cap.toFixed(2)}, ` +
+        `below the $${MIN_BUDGET_HEADROOM_USD.toFixed(2)} minimum. Re-run to route the feedback.`
+    );
+    return { state, nextStage: null };
+  }
+
+  const router = await invokeFeedbackRouter(budget, originStage);
+  console.log(
+    `    ${router.ok ? "ok" : "failed"} — ${router.numTurns} turns, $${router.costUsd.toFixed(4)} ` +
+      `(cumulative $${budget.spent.toFixed(4)} of $${budget.cap.toFixed(2)})`
+  );
+
+  if (!router.ok) {
+    // A router that cannot be understood is not a reason to guess. Stop.
+    console.log("");
+    console.log(`Halting: ${router.error ?? "unknown router failure"}`);
+    console.log(`Nothing was routed and no go-back was spent. ${FEEDBACK_LOG_DOC} is unchanged.`);
+    return { state, nextStage: null };
+  }
+
+  if (router.decisions.length === 0) {
+    console.log("");
+    console.log("The feedback-router returned no routing decisions — nothing needs re-running.");
+    return { state, nextStage: null };
+  }
+
+  const used = goBacksUsed(state);
+  console.log("");
+  console.log(
+    `${router.decisions.length} routing decision(s); go-backs used ${used} of ${maxGoBacksPerRun}.`
+  );
+
+  // The ordering, the gate and the one-per-drain rule all live in router.ts,
+  // which has no SDK import — so they can be exercised against hand-written
+  // decision sets without an API key. This function only logs and prints.
+  const drain = planDrain(router.decisions, {
+    originStage,
+    goBacksUsed: used,
+    maxGoBacksPerRun,
+    remainingUsd: budget.remaining,
+    isImplemented,
+    estimateUsd: estimateGoBackUsd,
+  });
+
+  for (const { decision, verdict, estimateUsd } of drain.items) {
+    const entry: RoutingLogEntry = {
+      id: decision.id,
+      ts: new Date().toISOString(),
+      origin_stage: originStage,
+      target_stage: decision.target_stage,
+      reason: decision.reason,
+      priority: decision.priority,
+      confidence: decision.confidence,
+      confidence_reason: decision.confidence_reason,
+      evidence: decision.evidence,
+      finding_ids: decision.finding_ids,
+      gate: verdict.gate,
+      enacted: verdict.enact,
+      outcome: verdict.enact ? "enacted" : verdict.escalation === null ? "deferred" : "escalated",
+      escalation: verdict.enact ? null : verdict.escalation,
+      estimate_usd: estimateUsd,
+      remaining_usd: budget.remaining,
+      go_backs_used: used,
+    };
+    await appendRoutingEntry(entry);
+
+    console.log("");
+    console.log(
+      `  ${decision.id} -> ${decision.target_stage} (${decision.priority} priority, ` +
+        `${decision.confidence} confidence) for ${decision.finding_ids.join(", ")}`
+    );
+    console.log(`    reason:   ${decision.reason}`);
+    console.log(`    evidence: ${decision.evidence.join("; ")}`);
+
+    if (verdict.enact) {
+      console.log(
+        `    ENACTED — re-running ${stagesRerunBy(decision.target_stage).join(" -> ")} ` +
+          `(estimated $${estimateUsd.toFixed(2)}, $${budget.remaining.toFixed(4)} left)`
+      );
+    } else if (verdict.escalation === null) {
+      console.log(`    deferred — one decision is enacted per drain; re-judged after the go-back.`);
+    } else {
+      console.log(`    ESCALATED (${verdict.escalation}) — ${verdict.summary ?? ""}`);
+    }
+  }
+
+  console.log("");
+  console.log(`Routing decisions logged to ${routingLogPath()}.`);
+
+  if (drain.enacted === null) {
+    console.log("");
+    console.log("No decision cleared the gate, so nothing was re-run and no money was spent on a");
+    console.log("go-back. This needs a human: read the escalations above, then either fix the");
+    console.log(`finding by hand or re-run the target stage deliberately with a reset ${"state/run.json"}.`);
+    return { state, nextStage: null };
+  }
+
+  // Rewind BEFORE the re-run so a crash mid-go-back resumes at the target
+  // rather than skipping it, and so the target's retry budget is the one for
+  // this attempt rather than a leftover from an earlier one.
+  state = recordGoBack(rewindTo(state, drain.enacted.target_stage));
+  console.log("");
+  console.log(
+    `Going back to "${drain.enacted.target_stage}" ` +
+      `(go-back ${goBacksUsed(state)} of ${maxGoBacksPerRun}).`
+  );
+  return { state, nextStage: drain.enacted.target_stage };
+}
+
+/**
+ * Invokes the critic on demand. NOT scheduled, and deliberately not wired into
+ * the linear loop or the go-back loop above.
+ *
+ * That is the user's own framing of this agent ("invoked independently whenever
+ * a critical lens is needed") and it is also what the generated plan says:
+ * auto-invoking the critic is M33, a "Could" item, i.e. explicitly a later
+ * feature. An agent that runs on every pass costs money on every pass whether
+ * or not anyone wanted its opinion.
+ *
+ * `target` is free text — a file path, a stage name, a question. The critic has
+ * Read/Grep/Glob and no Write, so IT reports back in its final message and THIS
+ * function persists the report, which is what keeps the agent usable from any
+ * calling context rather than tied to one fixed pipeline document.
+ */
+async function invokeCritic(target: string, budget: RunBudget): Promise<boolean> {
+  const definition = await loadAgentDefinition("critic");
+  await ensureWorkspace();
+
+  const prompt = [
+    `You have been invoked on demand to apply a critical lens. You are not running as a pipeline stage.`,
+    `What to critique: ${target}`,
+    `The pipeline's design documents are in ${DOCS_DIR} and the generated code is at ${workspaceRoot()}. ` +
+      `Both are readable; resolve the target above against them. If the target names a pipeline stage ` +
+      `rather than a file, critique that stage's output document.`,
+    `Judge it from a human perspective — user experience, output quality, and whether it matches what ` +
+      `a person actually meant rather than what the spec literally said. Conformance to the spec is ` +
+      `already the reviewer's job; do not repeat it.`,
+    `Report your critique in your final message. You have no Write tool — the orchestrator records ` +
+      `what you say into ${CRITIC_LOG_DOC}.`,
+  ].join("\n\n");
+
+  const outcome = await runQueryOnce("critic", definition, "critic", prompt, {
+    cwd: PROJECT_ROOT,
+    maxBudgetUsd: budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE),
+    additionalDirectories: [workspaceRoot()],
+  });
+  budget.record(outcome.costUsd);
+
+  if (!outcome.ok) {
+    console.error(`critic failed: ${outcome.text.slice(0, 500)}`);
+    return false;
+  }
+
+  const criticLogPath = path.join(PROJECT_ROOT, CRITIC_LOG_DOC);
+  let existing: string;
+  try {
+    existing = await readFile(criticLogPath, "utf-8");
+  } catch {
+    existing =
+      "<!-- Written by: the critic agent, on demand only (`npm run orchestrator -- --critic \"<target>\"`). Read by: humans. -->\n";
+  }
+
+  // C-n, monotonic, same scheme as RD-n/F-n (docs/lld.md §base).
+  let maxSession = 0;
+  for (const match of existing.matchAll(/^##\s+C-(\d+)\b/gm)) {
+    const n = Number(match[1]);
+    if (Number.isInteger(n) && n > maxSession) maxSession = n;
+  }
+  const sessionId = `C-${maxSession + 1}`;
+
+  const block = [
+    ``,
+    `## ${sessionId} ${new Date().toISOString()}`,
+    ``,
+    `**Target:** ${target}`,
+    ``,
+    `**Cost:** $${outcome.costUsd.toFixed(4)} over ${outcome.numTurns} turns`,
+    ``,
+    outcome.text.trim(),
+    ``,
+  ].join("\n");
+
+  await writeFile(criticLogPath, `${existing.trimEnd()}\n${block}`, "utf-8");
+
+  console.log("");
+  console.log(outcome.text.trim());
+  console.log("");
+  console.log(`Recorded as ${sessionId} in ${CRITIC_LOG_DOC} — $${outcome.costUsd.toFixed(4)}.`);
+  return true;
 }
 
 /**
@@ -634,7 +1117,14 @@ function nextLinearStage(current: PipelineStage | null): PipelineStage | null {
 
 // Re-exported so future phases (and tests) can reference them without
 // reaching into this file's internals.
-export { runStage, invokeFeedbackRouter, invokeCritic, nextLinearStage };
+export {
+  runStage,
+  invokeFeedbackRouter,
+  invokeCritic,
+  driveFeedbackLoop,
+  estimateGoBackUsd,
+  nextLinearStage,
+};
 export type { FeedbackRouterDecision, RunState };
 
 const IDEA_DOC_HEADER =
@@ -692,7 +1182,15 @@ interface CliArgs {
   /** Free text left after flags are removed; null when none was given. */
   idea: string | null;
   maxModules: number;
+  maxGoBacks: number;
+  /**
+   * `--critic <target>`. When set, the run does ONE critic session against
+   * that target and does nothing else — no stage runs, no state is touched.
+   */
+  critic: string | null;
 }
+
+const FLAGS_WITH_VALUES = ["--max-modules", "--max-go-backs", "--critic"] as const;
 
 /**
  * Splits `--flags` out of the product idea. Before Phase 4 every argument was
@@ -702,6 +1200,16 @@ interface CliArgs {
 function parseCliArgs(argv: string[]): CliArgs {
   const words: string[] = [];
   let maxModules = DEFAULT_MAX_MODULES;
+  let maxGoBacks = DEFAULT_MAX_GO_BACKS_PER_RUN;
+  let critic: string | null = null;
+
+  const positiveInteger = (name: string, value: string | undefined): number => {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new Error(`${name} needs a positive integer, got "${value ?? ""}".`);
+    }
+    return parsed;
+  };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i] ?? "";
@@ -713,22 +1221,30 @@ function parseCliArgs(argv: string[]): CliArgs {
     const eq = arg.indexOf("=");
     const name = eq === -1 ? arg : arg.slice(0, eq);
     let value = eq === -1 ? undefined : arg.slice(eq + 1);
-    if (name !== "--max-modules") {
-      throw new Error(`Unrecognised option "${name}". The only supported flag is --max-modules N.`);
+    if (!(FLAGS_WITH_VALUES as readonly string[]).includes(name)) {
+      throw new Error(
+        `Unrecognised option "${name}". Supported flags are ${FLAGS_WITH_VALUES.join(", ")}.`
+      );
     }
     if (value === undefined) {
       value = argv[i + 1];
       i += 1;
     }
-    const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed < 1) {
-      throw new Error(`--max-modules needs a positive integer, got "${value ?? ""}".`);
+
+    if (name === "--max-modules") maxModules = positiveInteger(name, value);
+    else if (name === "--max-go-backs") maxGoBacks = positiveInteger(name, value);
+    else {
+      // --max-go-backs 0 is a positive-integer error above; --critic "" is not,
+      // so it is rejected here rather than reaching the agent as an empty task.
+      if (value === undefined || value.trim().length === 0) {
+        throw new Error(`--critic needs something to critique, e.g. --critic docs/design.md`);
+      }
+      critic = value.trim();
     }
-    maxModules = parsed;
   }
 
   const idea = words.join(" ").trim();
-  return { idea: idea.length > 0 ? idea : null, maxModules };
+  return { idea: idea.length > 0 ? idea : null, maxModules, maxGoBacks, critic };
 }
 
 /** The idea currently recorded in docs/idea.md, or null if there isn't one. */
@@ -770,13 +1286,26 @@ function reportAlreadyComplete(state: RunState, nextStage: PipelineStage | null)
     if (io !== undefined) console.log(`  ${describeOutput(io.writes)}`);
   }
   console.log("");
+  if (state.stage === LAST_IMPLEMENTED_STAGE) {
+    console.log(
+      `The feedback loop already ran for this run (${goBacksUsed(state)} go-back(s) used). ` +
+        `Every routing decision, enacted or not, is in ${routingLogPath()}.`
+    );
+    console.log(
+      "Re-running does NOT re-drive the router: that would be a billable call nobody asked for. " +
+        "Act on the escalations there, or reset the run state below."
+    );
+    console.log("");
+  }
   if (nextStage === null) {
     console.log("There is no further stage in PIPELINE_STAGES.");
   } else {
     console.log(
-      `The next stage ("${nextStage}") is not implemented until Phase ${phaseForStage(nextStage)}+.`
+      NOT_IMPLEMENTED_REASONS[nextStage] ??
+        `The next stage ("${nextStage}") is not implemented until Phase ${phaseForStage(nextStage)}+.`
     );
   }
+  console.log("");
   console.log("To start a fresh run, reset the run state:");
   console.log("");
   console.log("  rm state/run.json && ./setup.sh");
@@ -793,6 +1322,22 @@ async function main(): Promise<void> {
   await loadDotEnv();
 
   const cli = parseCliArgs(process.argv.slice(2));
+
+  // --critic is a complete alternative to running the pipeline, handled before
+  // state is loaded or docs/idea.md is touched. The critic is ON DEMAND: it
+  // never runs as part of a pipeline invocation, so asking for one must not
+  // also advance, resume or complete a run as a side effect.
+  if (cli.critic !== null) {
+    reportAuthSource();
+    console.log(`Critic (on demand) — target: ${cli.critic}`);
+    console.log("No pipeline stage will run and no run state will be changed.");
+    const budget = new RunBudget(MAX_BUDGET_USD_PER_RUN);
+    const ok = await invokeCritic(cli.critic, budget);
+    console.log(`Total cost: $${budget.spent.toFixed(4)}`);
+    if (!ok) process.exitCode = 1;
+    return;
+  }
+
   const state0 = await loadState();
 
   // Resume/completion decisions happen BEFORE docs/idea.md is touched: a
@@ -836,12 +1381,14 @@ async function main(): Promise<void> {
   console.log(`Idea: ${idea}`);
   reportAuthSource();
   console.log(
-    `Phase ${CURRENT_PHASE} runs through "${LAST_IMPLEMENTED_STAGE}"; later stages are still stubbed.`
+    `Phase ${CURRENT_PHASE} runs through "${LAST_IMPLEMENTED_STAGE}", then routes feedback; ` +
+      `"testing-agent" is still blocked on M18.`
   );
   console.log(`MAX_RETRIES_PER_STAGE = ${MAX_RETRIES_PER_STAGE}`);
   console.log(
     `Run budget: $${MAX_BUDGET_USD_PER_RUN.toFixed(2)} cumulative, ` +
-      `$${MAX_BUDGET_USD_PER_STAGE.toFixed(2)} per call; --max-modules ${cli.maxModules}`
+      `$${MAX_BUDGET_USD_PER_STAGE.toFixed(2)} per call; --max-modules ${cli.maxModules}; ` +
+      `--max-go-backs ${cli.maxGoBacks} (used ${goBacksUsed(state0)} so far)`
   );
   console.log(`Code workspace: ${workspaceRoot()}`);
   if (state0.stage !== null) {
@@ -882,9 +1429,21 @@ async function main(): Promise<void> {
           `(cumulative $${budget.spent.toFixed(4)} of $${budget.cap.toFixed(2)})`
       );
 
+      // Reaching the last linear stage is no longer the end of the run — it is
+      // the point at which the loop closes. feedback-router may send execution
+      // back to an earlier stage, and the `while` then re-runs FORWARD from
+      // there through every downstream stage. That re-run is at full cost; see
+      // driveFeedbackLoop's header for why that is a chosen tradeoff.
       if (stage === LAST_IMPLEMENTED_STAGE) {
+        const loop = await driveFeedbackLoop(state, budget, stage, cli.maxGoBacks);
+        state = loop.state;
+        await saveState(state);
+        if (loop.nextStage !== null) {
+          stage = loop.nextStage;
+          continue;
+        }
         console.log("");
-        console.log(`Stopping at "${LAST_IMPLEMENTED_STAGE}" — end of Phase ${CURRENT_PHASE}.`);
+        console.log(`Stopping after "${LAST_IMPLEMENTED_STAGE}" — end of Phase ${CURRENT_PHASE}.`);
         break;
       }
       stage = nextLinearStage(stage);

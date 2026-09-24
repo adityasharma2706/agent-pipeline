@@ -24,6 +24,7 @@ DOC_HEADERS=(
   "lld.md|<!-- Written by: low-level-design stage. Read by: spec-implementer. -->"
   "implementer.md|<!-- Written by: implementation-planning stage (module list) and appended to by spec-implementer (progress log). Read by: system-design, low-level-design, spec-implementer. -->"
   "feedback_log.md|<!-- Written by: reviewer and testing-agent stages. Read by: feedback-router. -->"
+  "critic_log.md|<!-- Written by: the orchestrator, recording on-demand critic sessions (npm run orchestrator -- --critic \"<target>\"). Read by: humans. Never written on a schedule. -->"
 )
 
 for entry in "${DOC_HEADERS[@]}"; do

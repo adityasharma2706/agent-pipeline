@@ -5,7 +5,13 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PIPELINE_STAGES } from "./types.js";
-import type { HistoryEntry, PipelineStage, RunState, StageOutcome } from "./types.js";
+import type {
+  HistoryEntry,
+  PipelineStage,
+  RetryCounts,
+  RunState,
+  StageOutcome,
+} from "./types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE_PATH = path.join(__dirname, "..", "state", "run.json");
@@ -62,8 +68,22 @@ function isRunState(value: unknown): value is RunState {
 
   const retries = candidate.retries;
   if (typeof retries !== "object" || retries === null || Array.isArray(retries)) return false;
-  return Object.values(retries as Record<string, unknown>).every(
-    (count) => typeof count === "number" && Number.isInteger(count) && count >= 0
+  if (
+    !Object.values(retries as Record<string, unknown>).every(
+      (count) => typeof count === "number" && Number.isInteger(count) && count >= 0
+    )
+  ) {
+    return false;
+  }
+
+  // Absent is valid: every state file written before Phase 5 predates the
+  // field, and rejecting those would strand runs that are mid-pipeline right
+  // now. Present-but-nonsense is NOT valid — a corrupt go-back counter is the
+  // one thing standing between a bad router and an unbounded re-run loop.
+  const goBacks = candidate.goBacksUsed;
+  return (
+    goBacks === undefined ||
+    (typeof goBacks === "number" && Number.isInteger(goBacks) && goBacks >= 0)
   );
 }
 
@@ -199,4 +219,48 @@ export function recordRetry(state: RunState, stage: PipelineStage): RunState {
       [stage]: nextCount,
     },
   };
+}
+
+/** Reads the go-back counter, treating a pre-Phase-5 state file as zero. */
+export function goBacksUsed(state: RunState): number {
+  return state.goBacksUsed ?? 0;
+}
+
+/**
+ * Records that a go-back was enacted. The cap itself lives with the router
+ * gate (orchestrator/router.ts) rather than here, because exceeding it is an
+ * escalation with options for a human, not a thrown halt like recordRetry's.
+ */
+export function recordGoBack(state: RunState): RunState {
+  return { ...state, goBacksUsed: goBacksUsed(state) + 1 };
+}
+
+/**
+ * Clears the retry counters for `stage` and everything after it in the linear
+ * order, and rewinds `state.stage` to just before `stage`.
+ *
+ * Both halves matter for a go-back. Rewinding `state.stage` is what makes the
+ * re-run resumable: it means "the last stage that completed successfully" is
+ * once again the one before the target, so a crashed go-back resumes at the
+ * target rather than skipping it. Clearing the retries is what stops a stage
+ * that failed twice earlier in the run from getting only one attempt on its
+ * re-run — the loop guard for go-backs is maxGoBacksPerRun, not a retry
+ * counter carried over from a different attempt at a different input.
+ */
+export function rewindTo(state: RunState, stage: PipelineStage): RunState {
+  const targetIndex = PIPELINE_STAGES.indexOf(stage);
+  if (targetIndex === -1) {
+    throw new Error(`rewindTo() was given "${stage}", which is not a pipeline stage.`);
+  }
+
+  const retries: RetryCounts = {};
+  for (const [name, count] of Object.entries(state.retries)) {
+    const index = PIPELINE_STAGES.indexOf(name as PipelineStage);
+    if (index !== -1 && index < targetIndex && count !== undefined) {
+      retries[name as PipelineStage] = count;
+    }
+  }
+
+  const previous = targetIndex === 0 ? null : (PIPELINE_STAGES[targetIndex - 1] ?? null);
+  return { ...state, stage: previous, retries };
 }
