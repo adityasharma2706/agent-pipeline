@@ -119,8 +119,22 @@ const PERMISSION_MODE: PermissionMode = "bypassPermissions";
  * documents of ~6-11k output tokens, and low-level-design has to produce
  * implementation-ready specs for every module. It doubles as the per-MODULE cap
  * in Phase 4 — one module's code is the same order of output as one document.
+ *
+ * Raised again from $4.00 after a real run halted on it. Both calibrations so
+ * far were measured against a 36-module plan; the cost of the document stages
+ * scales with the number of modules they write about, and nothing caps how big
+ * a plan an idea produces. Measured: low-level-design cost $2.86 for 36 modules,
+ * and system-design hit $4.00 on a 53-module plan with a complete document
+ * already written. Linear scaling puts a 53-module low-level-design near $4.20,
+ * i.e. over the old cap before any variance.
+ *
+ * $8.00 is deliberate headroom rather than a tight fit, because a stage that
+ * exceeds this now HALTS the run (see result-failure.ts) — being slightly too
+ * low is expensive and disruptive, while being too high costs nothing unless a
+ * stage actually runs away, and the cumulative run budget still bounds that.
+ * It is not a prediction that any stage should cost $8.
  */
-const MAX_BUDGET_USD_PER_STAGE = 4.0;
+const MAX_BUDGET_USD_PER_STAGE = 8.0;
 
 /**
  * Minimum headroom required to start another query(). An allowance of a few
