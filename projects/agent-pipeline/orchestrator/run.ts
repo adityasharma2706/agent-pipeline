@@ -106,11 +106,14 @@ import { DOCS_DIR, IMPLEMENTER_DOC, buildModulePrompt } from "./module-prompt.js
 import {
   DeterministicStageFailure,
   ModuleAttemptsExhausted,
+  UsageLimitHalt,
   buildDeterministicHaltMessage,
   buildModuleExhaustedHaltMessage,
+  buildUsageLimitHaltMessage,
   classifyResult,
+  detectUsageLimit,
 } from "./result-failure.js";
-import type { ArtifactStatus, DeterministicFailure } from "./result-failure.js";
+import type { ArtifactStatus, DeterministicFailure, UsageLimit } from "./result-failure.js";
 
 /**
  * The pipeline is non-interactive: there is no human sitting there to answer a
@@ -570,6 +573,14 @@ interface QueryOutcome {
    * for a document that was already complete after the first attempt.
    */
   deterministic: DeterministicFailure | null;
+  /**
+   * Set when the call was blocked by the ACCOUNT rather than by anything in
+   * this run: a usage/session/rate limit. The caller must halt without
+   * recording an attempt — the agent never ran, so charging the module for it
+   * (which is what happened to M05 on a live run, three times) blames the code
+   * for the billing state and leaves the next run with no budget to resume on.
+   */
+  usageLimit: UsageLimit | null;
 }
 
 /**
@@ -631,6 +642,7 @@ async function runQueryOnce(
     numTurns: 0,
     structuredOutput: undefined,
     deterministic: null,
+    usageLimit: null,
   };
   let sawResultMessage = false;
 
@@ -648,8 +660,14 @@ async function runQueryOnce(
         numTurns: message.num_turns,
         structuredOutput: message.subtype === "success" ? message.structured_output : undefined,
         deterministic: classification.kind === "deterministic" ? classification.failure : null,
+        usageLimit: classification.kind === "limit" ? classification.limit : null,
       };
-      if (classification.kind === "deterministic") {
+      if (classification.kind === "limit") {
+        console.error(
+          `  [${label}] blocked by a ${classification.limit.signal} — NOT retrying and NOT ` +
+            `counting this as an attempt.`
+        );
+      } else if (classification.kind === "deterministic") {
         console.error(
           `  [${label}] SDK result hit a deterministic cap: ${classification.failure.subtype} — ` +
             `NOT retrying, an identical re-run would hit the same cap.`
@@ -662,8 +680,21 @@ async function runQueryOnce(
     // A thrown SDK error is transient by default: it never carried a result
     // subtype, so there is nothing to classify and the retry budget applies.
     const detail = err instanceof Error ? err.message : String(err);
-    console.error(`  [${label}] SDK call threw: ${detail}`);
-    return { ...outcome, ok: false, text: detail, deterministic: null };
+    // ...unless it is an environmental block. The CLI surfaces a usage limit as
+    // a thrown "Claude Code returned an error result: You've hit your session
+    // limit · resets ..." rather than as a result message, so this is the path
+    // that actually sees it. detectUsageLimit returns null when unsure, which
+    // leaves the pre-existing transient behaviour exactly as it was.
+    const usageLimit = detectUsageLimit(detail);
+    if (usageLimit !== null) {
+      console.error(
+        `  [${label}] blocked by a ${usageLimit.signal} — NOT retrying and NOT counting this ` +
+          `as an attempt.`
+      );
+    } else {
+      console.error(`  [${label}] SDK call threw: ${detail}`);
+    }
+    return { ...outcome, ok: false, text: detail, deterministic: null, usageLimit };
   }
 
   if (!sawResultMessage) {
@@ -672,6 +703,23 @@ async function runQueryOnce(
     );
   }
   return outcome;
+}
+
+/**
+ * Halts the run when a call was blocked by a usage/session/rate limit.
+ *
+ * The third category alongside the two that already existed: a fatal config
+ * fault throws, a transient SDK error is retried, and an ENVIRONMENTAL BLOCK
+ * halts without being charged to anything. Called immediately after every
+ * query(), before any verification, ledger write or retry decision, because
+ * the whole point is that no record of an attempt is made.
+ */
+function haltIfUsageLimit(label: string, outcome: QueryOutcome): void {
+  if (outcome.usageLimit === null) return;
+  throw new UsageLimitHalt(
+    buildUsageLimitHaltMessage({ label, limit: outcome.usageLimit, costUsd: outcome.costUsd }),
+    outcome.usageLimit
+  );
 }
 
 /** A stage whose whole job is one markdown file — the Phase 1-3 shape, unchanged. */
@@ -701,6 +749,7 @@ async function runDocumentStage(
     }
   );
   budget.record(outcome.costUsd);
+  haltIfUsageLimit(stageName, outcome);
 
   // A cap failure is fatal, not retryable — the same idiom runStage already
   // uses for configuration faults. Before halting, LOOK AT WHAT WAS WRITTEN:
@@ -992,6 +1041,10 @@ async function runModuleStage(
         }
       );
       budget.record(outcome.costUsd);
+      // BEFORE the snapshot, the typecheck and the ledger write: a limit means
+      // the agent never ran, so there is no attempt to record and nothing to
+      // verify. Recording one here is the bug this guard exists for.
+      haltIfUsageLimit(`${stageName}/${spec.id}`, outcome);
       aggregate.costUsd += outcome.costUsd;
       aggregate.numTurns += outcome.numTurns;
 
@@ -1213,6 +1266,7 @@ async function invokeFeedbackRouter(
     outputSchema: ROUTER_OUTPUT_SCHEMA,
   });
   budget.record(outcome.costUsd);
+  haltIfUsageLimit("feedback-router", outcome);
 
   const base = { costUsd: outcome.costUsd, numTurns: outcome.numTurns, decisions: [] };
   if (!outcome.ok) {
@@ -1478,6 +1532,7 @@ async function invokeCritic(target: string, budget: RunBudget): Promise<boolean>
     additionalDirectories: [workspaceRoot()],
   });
   budget.record(outcome.costUsd);
+  haltIfUsageLimit("critic", outcome);
 
   if (outcome.deterministic !== null) {
     // The critic is a single on-demand call with no retry loop, so this only

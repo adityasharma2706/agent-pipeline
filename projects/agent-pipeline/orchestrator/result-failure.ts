@@ -59,7 +59,168 @@ export interface DeterministicFailure {
 export type ResultClassification =
   | { kind: "success" }
   | { kind: "transient"; subtype: string }
-  | { kind: "deterministic"; failure: DeterministicFailure };
+  | { kind: "deterministic"; failure: DeterministicFailure }
+  | { kind: "limit"; limit: UsageLimit };
+
+// ---------------------------------------------------------------------------
+// The third category: an ENVIRONMENTAL BLOCK.
+//
+// A fatal config fault throws and is never retried. A transient SDK error is
+// retried. A usage/session/rate limit is neither: the agent never ran, nothing
+// was written, and no amount of retrying can succeed until the provider's
+// clock says so. Charging it to MAX_ATTEMPTS_PER_MODULE blames the module for
+// the account's billing state — which is exactly what happened on a live run:
+//
+//   M05  failure  0 files  $0.8030   ... You've hit your session limit ...
+//   M05  failure  0 files  $0.0000   ... You've hit your session limit ...
+//   M05  failure  0 files  $0.0000   ... You've hit your session limit ...
+//
+// Three attempts gone, and the NEXT run halts on M05 with "no budget left"
+// while nothing is wrong with M05. So this halts the run without recording an
+// attempt at all.
+// ---------------------------------------------------------------------------
+
+/** A detected usage/session/rate limit, with the provider's own words kept. */
+export interface UsageLimit {
+  /** Which signal matched, for the log line and for tests. */
+  signal: UsageLimitSignal;
+  /** The provider's message, verbatim and untruncated as far as we received it. */
+  providerText: string;
+  /**
+   * The provider's own reset phrasing, e.g. "resets 11:50am (Asia/Calcutta)",
+   * quoted exactly as received. Deliberately NOT parsed into a timestamp: the
+   * format is the provider's to change, and a wrong local time here would be
+   * worse than no time at all.
+   */
+  resetHint: string | null;
+}
+
+export type UsageLimitSignal = "session limit" | "usage limit" | "rate limit" | "quota";
+
+/**
+ * The signals we are willing to treat as "do not retry, do not blame the
+ * module".
+ *
+ * Chosen to be narrow on purpose. A false positive here means a REAL failure is
+ * never retried and the run halts telling a human their account is throttled
+ * when it is not — so each pattern requires the word "limit" or "quota" with
+ * its own qualifier attached, rather than any mention of "limit" (which appears
+ * in "max turns limit", "structured-output retry limit", and in ordinary model
+ * prose) or any mention of "quota" alone.
+ *
+ * Wording varies between providers and between the CLI's own phrasings, which
+ * is why this matches a handful of phrases case-insensitively instead of the
+ * one observed sentence ("You've hit your session limit · resets 11:50am
+ * (Asia/Calcutta)"). Anything that matches nothing falls through to the
+ * existing transient/deterministic behaviour, which is the safe default.
+ */
+const USAGE_LIMIT_PATTERNS: readonly { signal: UsageLimitSignal; re: RegExp }[] = [
+  // "You've hit your session limit", "session limit reached".
+  { signal: "session limit", re: /\bsession limit\b/i },
+  // "usage limit reached", "monthly usage limit".
+  { signal: "usage limit", re: /\busage limit\b/i },
+  // "rate limit exceeded", "rate_limit_error", "rate-limited".
+  { signal: "rate limit", re: /\brate[ _-]?limit(ed|s|_error)?\b/i },
+  // Quota needs an exhaustion word: "quota" on its own shows up in capability
+  // descriptions and in unrelated tool output.
+  { signal: "quota", re: /\bquota\b[^.\n]{0,40}\b(exceeded|exhausted|reached|remaining)\b/i },
+  { signal: "quota", re: /\b(exceeded|exhausted|out of|no remaining)\b[^.\n]{0,40}\bquota\b/i },
+];
+
+/** "resets 11:50am (Asia/Calcutta)" / "try again at 3pm", echoed, never parsed. */
+const RESET_HINT_RE = /\b(resets?(?: at)?|try again(?: at| in)?|available again(?: at)?)\b[^\n]*/i;
+
+/**
+ * Detects an environmental limit in whatever text the SDK gave us — a thrown
+ * error's message, or a result message's error text.
+ *
+ * Returns null when unsure. The caller then behaves exactly as it did before
+ * this function existed.
+ */
+export function detectUsageLimit(text: string | null | undefined): UsageLimit | null {
+  if (typeof text !== "string" || text.trim().length === 0) return null;
+  for (const { signal, re } of USAGE_LIMIT_PATTERNS) {
+    if (!re.test(text)) continue;
+    const hint = RESET_HINT_RE.exec(text);
+    return {
+      signal,
+      providerText: text.trim(),
+      resetHint: hint === null ? null : hint[0].trim(),
+    };
+  }
+  return null;
+}
+
+/**
+ * Thrown instead of recording a failed attempt. main()'s catch prints it as a
+ * halt, exactly like DeterministicStageFailure — same idiom, different cause.
+ */
+export class UsageLimitHalt extends Error {
+  readonly limit: UsageLimit;
+
+  constructor(message: string, limit: UsageLimit) {
+    super(message);
+    this.name = "UsageLimitHalt";
+    this.limit = limit;
+  }
+}
+
+export interface UsageLimitHaltContext {
+  /** Stage name, or "spec-implementer/M05". */
+  label: string;
+  limit: UsageLimit;
+  /** What this blocked call was billed, usually $0.00 and sometimes not. */
+  costUsd: number;
+}
+
+/**
+ * The halt message for an environmental limit.
+ *
+ * Short on purpose, and the opposite of every other halt message in this file.
+ * Those are long because a human has a real decision to make — accept the
+ * artifact, raise a cap, fix the code by hand. Here there is no decision: the
+ * account is throttled, nothing is broken, and the only action is to wait. The
+ * message this replaced offered three remedies, none of which applied, and
+ * claimed the failed attempts had been "INFORMED by the previous attempt's
+ * exact diagnostics" when the agent had never run at all.
+ */
+export function buildUsageLimitHaltMessage(ctx: UsageLimitHaltContext): string {
+  const lines: string[] = [
+    `Stopped at "${ctx.label}": this Claude account has hit a usage limit.`,
+    ``,
+    `  provider said: ${ctx.limit.providerText}`,
+  ];
+  if (ctx.limit.resetHint !== null) {
+    lines.push(`  resets:        ${ctx.limit.resetHint} (the provider's wording, quoted as-is)`);
+  }
+  lines.push(
+    `  cost:          ${usd(ctx.costUsd)}`,
+    ``,
+    `NOTHING IS WRONG WITH THE CODE, THE PLAN, OR THE PIPELINE. The agent never ran, so`,
+    `this was not counted as an attempt and no retry budget was spent on it.`,
+    ``,
+    `Wait for the limit to reset, then run the same command again:`,
+    ``,
+    `  npm run orchestrator`,
+    ``,
+    `Completed modules are skipped, not rebuilt.`
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Whatever error prose a result message carries: the `errors` array on the
+ * error variants, or `result` on a `success`-subtype message flagged is_error.
+ * Defensive about both, for the same reason classifyResult is below.
+ */
+function resultErrorText(message: SDKResultMessage): string {
+  if (message.subtype === "success") {
+    return typeof message.result === "string" ? message.result : "";
+  }
+  const raw: unknown = message.errors;
+  if (!Array.isArray(raw)) return "";
+  return (raw as unknown[]).filter((entry): entry is string => typeof entry === "string").join(" | ");
+}
 
 /**
  * Classifies one `type: "result"` message.
@@ -70,6 +231,14 @@ export type ResultClassification =
  */
 export function classifyResult(message: SDKResultMessage): ResultClassification {
   if (message.subtype === "success" && !message.is_error) return { kind: "success" };
+
+  // Before anything else: an environmental limit is not the module's failure
+  // and not a cap of ours. In practice the CLI raises this as a thrown error
+  // rather than a result message (runQueryOnce's catch handles that path), but
+  // the same text can arrive here, and it must mean the same thing in both.
+  const limit = detectUsageLimit(resultErrorText(message));
+  if (limit !== null) return { kind: "limit", limit };
+
   // `message.subtype !== "success"` first: that is what narrows the union to
   // SDKResultError, which is the variant carrying `errors`. isDeterministic-
   // Subtype alone is a guard over `string` and narrows nothing.
@@ -310,6 +479,19 @@ function evidenceBlock(label: string, lines: readonly string[]): string[] {
   return out;
 }
 
+/**
+ * Whether the recorded failure carries anything an informed retry could have
+ * been built from. An "sdk" failure — the call itself did not complete — does
+ * not, and the halt message must not claim otherwise.
+ */
+function hasDiagnostics(failure: ModuleAttemptFailure): boolean {
+  return (
+    failure.typecheckErrors.length > 0 ||
+    failure.stubFindings.length > 0 ||
+    failure.unownedReqs.length > 0
+  );
+}
+
 /** The diagnostics of the last attempt, whichever kind it was. */
 function failureEvidence(failure: ModuleAttemptFailure): string[] {
   return [
@@ -364,25 +546,48 @@ export function buildModuleExhaustedHaltMessage(ctx: ModuleExhaustedHaltContext)
     lines.push(`${ctx.notAttempted.length} module(s) were therefore not attempted: ${shown}${elided}`);
   }
 
+  // Only true when the attempts actually produced diagnostics to carry forward.
+  // An SDK-level failure (the call never completed) has none, and claiming it
+  // did is how a human gets sent looking for evidence that does not exist.
+  const informed = ctx.attemptsUsed > 1 && hasDiagnostics(ctx.failure);
+  if (informed) {
+    lines.push(
+      ``,
+      `Attempts 2 and ${ctx.maxAttempts} were INFORMED — each was given the previous attempt's exact`,
+      `diagnostics and told to repair its own files (orchestrator/retry-context.ts). They still`,
+      `did not converge, so another identical-in-spirit attempt is money spent on the same`,
+      `outcome. This is the point where a human is cheaper than the model.`
+    );
+  } else {
+    lines.push(
+      ``,
+      `The attempts produced no diagnostics to carry forward — the failures were at the SDK`,
+      `call level rather than at verification — so each retry started from the same place as`,
+      `the first. Re-running as-is is unlikely to end differently.`
+    );
+  }
+
+  lines.push(``, `WHAT YOU CAN DO, cheapest first:`, ``);
+
+  if (ctx.filesWritten.length > 0) {
+    lines.push(
+      `1. Fix the files yourself, in the workspace. They are listed above and are real code,`,
+      `   not a draft — the rest of the module passed every check that is not named above.`,
+      `   Then mark the attempt good, by editing the LAST ${ctx.moduleId} entry in:`
+    );
+  } else {
+    lines.push(
+      `1. Write the module yourself, in the workspace — the attempts left nothing on disk to`,
+      `   repair. Then mark the attempt good, by editing the LAST ${ctx.moduleId} entry in:`
+    );
+  }
+
   lines.push(
-    ``,
-    `Attempts 2 and ${ctx.maxAttempts} were INFORMED — each was given the previous attempt's exact`,
-    `diagnostics and told to repair its own files (orchestrator/retry-context.ts). They still`,
-    `did not converge, so another identical-in-spirit attempt is money spent on the same`,
-    `outcome. This is the point where a human is cheaper than the model.`,
-    ``,
-    `WHAT YOU CAN DO, cheapest first:`,
-    ``,
-    `1. Fix the files yourself, in the workspace. They are listed above and are real code,`,
-    `   not a draft — the rest of the module passed every check that is not named above.`,
-    `   The workspace has no node_modules, so unresolved-import errors in your editor are`,
-    `   expected and are not what failed.`,
-    `   Then mark the attempt good, by editing the LAST ${ctx.moduleId} entry in:`,
     ``,
     `     ${ctx.ledgerPath}`,
     ``,
     `   ...setting its "outcome" to "success". The next run skips ${ctx.moduleId} and continues`,
-    `   from the module after it. You are vouching for code the verifier rejected, so run`,
+    `   from the module after it. You are vouching for code the pipeline never passed, so run`,
     `   \`npx tsc --noEmit\` in the workspace yourself first.`,
     ``,
     `2. Give it a fresh budget, if you believe the failures were flukes rather than a`,
@@ -393,7 +598,9 @@ export function buildModuleExhaustedHaltMessage(ctx: ModuleExhaustedHaltContext)
     `3. Investigate the spec, if the module is being asked for something it cannot do —`,
     `   a dependency its \`Depends on:\` line does not name, a REQ that belongs elsewhere,`,
     `   a design the plan never settled. Read the ${ctx.moduleId} section of docs/implementer.md`,
-    `   against the diagnostics above. If the plan is wrong, no number of retries fixes it,`,
+    informed
+      ? `   against the diagnostics above. If the plan is wrong, no number of retries fixes it,`
+      : `   and judge it on its own. If the plan is wrong, no number of retries fixes it,`,
     `   and the repair is a go-back to implementation-planning rather than another build.`,
     ``,
     `Nothing was lost. Every module that passed is recorded in the ledger and will be`,

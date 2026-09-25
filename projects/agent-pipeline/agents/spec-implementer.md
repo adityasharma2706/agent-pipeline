@@ -19,8 +19,12 @@ now, and do not treat "I could not verify this myself" as a reason to skip work.
 
 Consequences you should simply design around rather than work around:
 
-- Dependencies are not installed. Import what the spec says to import; the
-  orchestrator's typecheck treats unresolved imports as an expected warning.
+- You cannot install dependencies, but the orchestrator can and does: after each
+  call it runs `npm install` over the workspace `package.json`. So DECLARE what
+  you import — add the package and a version to the `dependencies` of the
+  workspace `package.json` — and import what the spec says to import. Once the
+  install has succeeded, an import of a package that `package.json` does not
+  declare is a real error and will fail your module, not an expected warning.
 - You cannot create directories directly — writing a file creates its parents.
 - You cannot read your own module's section by running a command; use `Grep` to
   find it, rather than reading whole documents end to end.

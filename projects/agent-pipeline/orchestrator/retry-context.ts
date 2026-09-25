@@ -43,10 +43,14 @@ export interface ModuleFailureRecord {
   /**
    * Real `tsc --noEmit` diagnostic lines, verbatim.
    *
-   * TS2307 (unresolved import) lines are NOT in here and must never be: the
-   * workspace has no node_modules and the agent has no shell, so every import
-   * of anything produces one. They are expected, not the agent's fault, and
-   * drowning the one real error in forty of them is how this gets ignored.
+   * TS2307 (unresolved import) lines are in here only when the dependency
+   * install SUCCEEDED (orchestrator/deps.ts), i.e. when every package the
+   * workspace package.json declares is on disk and an unresolved import
+   * therefore means an undeclared one — a real defect. When no install
+   * succeeded (--no-install, a failed install, no manifest) they are filtered
+   * out upstream by verifyModule: they are then the expected consequence of an
+   * empty node_modules, not the agent's fault, and drowning the one real error
+   * in forty of them is how this gets ignored.
    */
   typecheckErrors: string[];
   /** `file:line — label: text` for each placeholder hit the stub scan found. */
@@ -259,9 +263,10 @@ function diagnosis(record: ModuleFailureRecord): string[] {
         `WHAT WENT WRONG: the orchestrator ran \`tsc --noEmit\` over the whole workspace after ` +
           `your last call and it reported ${record.typecheckErrors.length} genuine error(s) in the ` +
           `code you wrote.`,
-        `Unresolved-import diagnostics (TS2307) are EXPECTED in this workspace — nothing is ` +
-          `installed and you have no shell — and have already been filtered out. Every line below ` +
-          `is a real defect and is yours to fix:`,
+        `Diagnostics that are not your fault have already been filtered out — if an ` +
+          `unresolved-import (TS2307) line is below, the orchestrator did install this ` +
+          `workspace's declared dependencies, so that import names a package package.json does ` +
+          `not declare. Every line below is a real defect and is yours to fix:`,
         fence(record.typecheckErrors),
       ];
     case "stub":
@@ -285,7 +290,10 @@ function diagnosis(record: ModuleFailureRecord): string[] {
       ];
     case "sdk":
       return [
-        `WHAT WENT WRONG: your last call did not complete successfully. ${record.reason}`,
+        `WHAT WENT WRONG: your last call did not complete successfully — the failure was at the ` +
+          `SDK call level, not at verification. There are no diagnostics and no findings to show ` +
+          `you, because no check ever got to run on your output. All that is known is this:`,
+        fence([record.reason]),
       ];
   }
 }
@@ -386,9 +394,20 @@ export function renderRetryGuidance(moduleId: string, prior: PriorAttempt): stri
           ]
         : absentFilesParagraph(prior);
 
+  // The banner has to match the instruction underneath it. "Repair, do not
+  // start over" is right for a verification rejection and wrong for a call that
+  // never completed and left nothing to repair.
+  const banner =
+    prior.record.kind === "sdk" && prior.filesWritten.length === 0
+      ? `=== THIS IS A RETRY. THE PREVIOUS ATTEMPT DID NOT COMPLETE. ===`
+      : `=== THIS IS A RETRY. REPAIR THE PREVIOUS ATTEMPT — DO NOT START OVER. ===`;
+
   return [
-    `=== THIS IS A RETRY. REPAIR THE PREVIOUS ATTEMPT — DO NOT START OVER. ===`,
-    `Attempt ${prior.attemptNumber} at ${moduleId} was rejected by the orchestrator's verification.`,
+    banner,
+    prior.record.kind === "sdk"
+      ? `Attempt ${prior.attemptNumber} at ${moduleId} did not complete — the SDK call itself ` +
+        `failed, so the orchestrator never got to verify anything.`
+      : `Attempt ${prior.attemptNumber} at ${moduleId} was rejected by the orchestrator's verification.`,
     ...provenance,
     ...diagnosis(prior.record),
     ...fileList,

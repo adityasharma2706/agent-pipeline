@@ -312,7 +312,11 @@ price. The halt
 as the deterministic halt below) names the module and its position in the plan,
 what the last attempt was rejected for with the verbatim diagnostics, what the
 three attempts cost in total, the files it left in the workspace, how many
-modules were consequently not attempted, and three ranked things a human can do:
+modules were consequently not attempted, and three ranked things a human can do
+(the "attempts 2 and 3 were informed" claim and the "fix the files yourself"
+option are both conditional — an SDK-level failure produces no diagnostics to
+carry forward and may leave no files, and the message says so rather than
+sending a human after evidence that does not exist):
 repair the files by hand and mark that ledger entry `"outcome": "success"` (the
 only way to accept code the verifier rejected, and deliberately a manual edit),
 delete the module's failed ledger entries to buy another three attempts, or read
@@ -356,6 +360,81 @@ Known limitation, stated rather than hidden: `--accept-stage` verifies that the
 artifact is real, not that it belongs to the current idea. A leftover document
 from a previous product would pass. That is what "you are vouching for it"
 means.
+
+### Usage limits are not the module's fault
+
+A third category sits alongside the two above: an **environmental block**. A
+fatal configuration fault throws and is never retried; a transient SDK error is
+retried; a usage/session/rate limit is *neither*.
+
+It looks like this, from a live run:
+
+```
+rejected: sdk — the SDK call did not succeed: Claude Code returned an error result:
+You've hit your session limit · resets 11:50am (Asia/Calcutta)
+```
+
+The account had run out of allowance. The agent never started, nothing reached
+disk, and retrying could not succeed until the provider's clock said so — yet
+the module loop recorded it as a failed attempt at `M05` and did it twice more,
+burning the whole `MAX_ATTEMPTS_PER_MODULE` budget in a few seconds. The next
+run would then have halted on `M05` with "no budget left" while nothing
+whatsoever was wrong with `M05`.
+
+So `detectUsageLimit` (`orchestrator/result-failure.ts`) classifies it and the
+run **halts without recording an attempt**. `haltIfUsageLimit` is called
+immediately after every `query()` — before the workspace snapshot, the
+typecheck, the verification and the ledger write — because the entire point is
+that no attempt is written down. It covers the document stages, the module
+loop, the feedback-router and the critic.
+
+Detection is on the SDK error text, because that is the only place the
+information exists: the CLI surfaces a limit as a *thrown* error rather than as
+a result subtype. Wording varies, so it matches a small set of signals
+case-insensitively rather than the one observed sentence:
+
+| signal | pattern | |
+| --- | --- | --- |
+| session limit | `\bsession limit\b` | "You've hit your session limit" |
+| usage limit | `\busage limit\b` | "usage limit reached" |
+| rate limit | `\brate[ _-]?limit(ed\|s\|_error)?\b` | "rate_limit_error", "rate-limited" |
+| quota | `quota` **with** an exhaustion word within 40 chars | "quota exceeded", "out of quota" |
+
+Deliberately narrow, because **a false positive is worse than a miss**: it would
+stop a real, retryable failure from ever being retried and tell a human their
+account is throttled when it is not. Bare "limit" is not enough — the phrase
+occurs in `error_max_turns`'s own description, in "structured-output retry
+limit" and in ordinary model prose — and bare "quota" is not enough, because
+generated products have quota *features*. Anything that matches nothing falls
+through to the pre-existing transient/deterministic behaviour.
+
+The halt message for this case is short, and it is the one halt in the system
+that offers no options, because there is no decision to make:
+
+```
+Stopped at "spec-implementer/M05": this Claude account has hit a usage limit.
+
+  provider said: Claude Code returned an error result: You've hit your session limit · resets 11:50am (Asia/Calcutta)
+  resets:        resets 11:50am (Asia/Calcutta) (the provider's wording, quoted as-is)
+  cost:          $0.8030
+
+NOTHING IS WRONG WITH THE CODE, THE PLAN, OR THE PIPELINE. The agent never ran, so
+this was not counted as an attempt and no retry budget was spent on it.
+
+Wait for the limit to reset, then run the same command again:
+
+  npm run orchestrator
+
+Completed modules are skipped, not rebuilt.
+```
+
+The reset time is **echoed, never parsed**. The provider's format is the
+provider's to change, and a wrong local time here would be worse than none.
+
+One deliberate omission: there is no automatic cleanup of limit-caused entries
+already in a ledger. The three bogus `M05` rows the bug wrote were removed by
+hand, once. "Purge failures on load" is a rule that would eventually delete real
+history.
 
 ### Safety rails
 
