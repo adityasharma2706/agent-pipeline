@@ -105,7 +105,5 @@
       "outcome": "in-progress"
     }
   ],
-  "retries": {
-    "spec-implementer": 1
-  }
+  "retries": {}
 }

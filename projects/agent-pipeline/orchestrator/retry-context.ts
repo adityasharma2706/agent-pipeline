@@ -3,7 +3,7 @@
 // The bug this exists to fix: a module that failed verification was retried
 // with a BYTE-IDENTICAL prompt. The orchestrator knew exactly what was wrong —
 // it had the tsc diagnostics in its hand — and threw them away, so the agent
-// re-rolled blind at full price, up to MAX_RETRIES_PER_STAGE times. One live
+// re-rolled blind at full price, for every attempt in its budget. One live
 // run paid $2.29 for the first attempt and would have paid it three more times
 // for the same type error on the same line.
 //
@@ -75,7 +75,7 @@ export interface PriorAttempt {
   record: ModuleFailureRecord;
   /** Workspace-relative paths the failed attempt touched. Still on disk. */
   filesWritten: string[];
-  /** 1 for the first failure, 2 for the second, ... */
+  /** 1 for the first failure, 2 for the second, ... Counted by failedAttemptCount. */
   attemptNumber: number;
   /**
    * True when the failure was recorded by an EARLIER orchestrator process —
@@ -112,6 +112,58 @@ function absentFilesParagraph(prior: PriorAttempt): string[] {
 const MAX_RENDERED_LINES = 20;
 
 /**
+ * How many times ONE module may be attempted before the stage halts.
+ *
+ * This is the per-module twin of MAX_RETRIES_PER_STAGE (orchestrator/state.ts),
+ * and it exists because the two budgets count different things. A document stage
+ * is one call producing one artifact, so "three attempts at the stage" is the
+ * same sentence as "three attempts at the work". spec-implementer is a loop over
+ * a whole plan — 53 modules in the current one — so charging a module's failure
+ * to the STAGE counter means three failures spread anywhere across 53 modules
+ * exhaust the budget for the entire build, and (because state.retries is
+ * persisted and only `--accept-stage` clears it) every later run then halts on
+ * its first failure with no attempts at all.
+ *
+ * 3 rather than more: attempts 2 and 3 are informed ones — they carry the exact
+ * diagnostics of the previous failure (see renderRetryGuidance) — so a module
+ * that has failed three times with the error in front of it is not converging,
+ * and a fourth attempt is paying full price for the same outcome. 3 rather than
+ * fewer: the one live failure this was measured against (M01, a single TS2322 on
+ * one line) is exactly the kind that a first informed retry fixes.
+ *
+ * Attempts are counted from the workspace ledger, not from a counter in this
+ * process — see failedAttemptCount.
+ */
+export const MAX_ATTEMPTS_PER_MODULE = 3;
+
+/**
+ * How many failed attempts at `moduleId` are already on record, counting only
+ * those SINCE the module last succeeded.
+ *
+ * The ledger is the home for this count rather than state/run.json, for the same
+ * reason the failure records themselves live there: the failing FILES are in the
+ * workspace, and the count of attempts at them has to survive together with them
+ * and with the diagnostics that describe them. A resumed run then knows both what
+ * broke and how many times, from one read of one file, and a module can never be
+ * charged for attempts made against a different workspace.
+ *
+ * Resetting at a success is what makes a go-back safe: a module that failed twice,
+ * passed, and is being rebuilt against a revised plan starts from a full budget,
+ * because those failures were against different input.
+ */
+export function failedAttemptCount(
+  entries: readonly FailedAttemptSource[],
+  moduleId: string
+): number {
+  let count = 0;
+  for (const entry of entries) {
+    if (entry.moduleId !== moduleId) continue;
+    count = entry.outcome === "success" ? 0 : count + 1;
+  }
+  return count;
+}
+
+/**
  * The most recent failed attempt at `moduleId`, or null if the module has never
  * failed (or its last recorded attempt succeeded).
  *
@@ -139,7 +191,7 @@ export function latestFailedAttempt(
   return {
     record,
     filesWritten: latest.filesWritten,
-    attemptNumber: own.filter((entry) => entry.outcome === "failure").length,
+    attemptNumber: failedAttemptCount(entries, moduleId),
     crossProcess: latest.finishedAt < processStartedAtIso,
     filesVanished: false,
   };

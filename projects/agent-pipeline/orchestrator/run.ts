@@ -76,7 +76,9 @@ import {
 import { appendRoutingEntry, loadRoutingLog, nextRoutingDecisionId, routingLogPath } from "./routing.js";
 import { MAX_BUDGET_USD_PER_RUN, RunBudget } from "./budget.js";
 import { loadModules } from "./modules.js";
+import type { ModuleSpec } from "./modules.js";
 import {
+  PROGRESS_JSON,
   changedFiles,
   ensureWorkspace,
   existingWorkspaceFiles,
@@ -93,12 +95,18 @@ import {
 } from "./progress.js";
 import type { LedgerIdentity, ProgressLog } from "./progress.js";
 import { parseReportedProgress, verifyModule } from "./verify.js";
-import { latestFailedAttempt } from "./retry-context.js";
+import {
+  MAX_ATTEMPTS_PER_MODULE,
+  failedAttemptCount,
+  latestFailedAttempt,
+} from "./retry-context.js";
 import type { ModuleFailureRecord, PriorAttempt } from "./retry-context.js";
 import { DOCS_DIR, IMPLEMENTER_DOC, buildModulePrompt } from "./module-prompt.js";
 import {
   DeterministicStageFailure,
+  ModuleAttemptsExhausted,
   buildDeterministicHaltMessage,
+  buildModuleExhaustedHaltMessage,
   classifyResult,
 } from "./result-failure.js";
 import type { ArtifactStatus, DeterministicFailure } from "./result-failure.js";
@@ -760,9 +768,17 @@ async function currentLedgerIdentity(): Promise<LedgerIdentity> {
  * over the whole workspace is clean apart from TS2307 (unresolved imports,
  * which are expected — there is no shell, so nothing was ever installed).
  *
- * The loop stops at the first module failure rather than carrying on: later
- * modules import earlier ones, so continuing past a broken module buys a
- * cascade of failures at full price.
+ * A module that fails is retried IN PLACE, up to MAX_ATTEMPTS_PER_MODULE
+ * attempts, each one told exactly what the previous one broke. The budget is
+ * per-module and counted in the workspace ledger, not the stage retry counter in
+ * state/run.json: this stage is one call per module over a whole plan, so
+ * charging module failures to the stage would let three bad modules out of 53
+ * end the build — permanently, since that counter is persisted.
+ *
+ * When a module uses up its own budget the STAGE halts rather than moving on:
+ * later modules import earlier ones, so continuing past a broken module buys a
+ * cascade of failures at full price. See buildModuleExhaustedHaltMessage for
+ * what the human is told at that point.
  */
 /**
  * What the previous failed attempt at `moduleId` left behind, or null if there
@@ -787,6 +803,55 @@ async function priorAttemptFor(progress: ProgressLog, moduleId: string): Promise
     filesWritten: present,
     filesVanished: prior.filesWritten.length > 0 && present.length === 0,
   };
+}
+
+/**
+ * Everything the "this module used up its attempts" halt needs, read out of the
+ * ledger rather than tracked in memory — the count, the last diagnostics and the
+ * files all come from the same place, so a halt on attempt 3 of a resumed run
+ * says exactly what a halt on attempt 3 of one long run says.
+ */
+async function moduleExhaustedHalt(
+  stageName: PipelineStage,
+  spec: ModuleSpec,
+  position: number,
+  modules: readonly ModuleSpec[],
+  progress: ProgressLog,
+  attemptsUsed: number,
+  completed: ReadonlySet<string>
+): Promise<ModuleAttemptsExhausted> {
+  // Non-null in practice: attemptsUsed > 0 means the module's latest entry is a
+  // failure, which is exactly when priorAttemptFor returns a record. The
+  // fallback exists so a halt message can never be the thing that crashes.
+  const prior = await priorAttemptFor(progress, spec.id);
+  const costUsd = progress.entries
+    .filter((entry) => entry.moduleId === spec.id)
+    .reduce((total, entry) => total + entry.costUsd, 0);
+
+  const message = buildModuleExhaustedHaltMessage({
+    stage: stageName,
+    moduleId: spec.id,
+    moduleTitle: spec.title,
+    position,
+    moduleCount: modules.length,
+    attemptsUsed,
+    maxAttempts: MAX_ATTEMPTS_PER_MODULE,
+    costUsd,
+    failure: prior?.record ?? {
+      kind: "sdk",
+      reason: "the last attempt was recorded as a failure with no structured detail",
+      typecheckErrors: [],
+      stubFindings: [],
+      unownedReqs: [],
+    },
+    filesWritten: prior?.filesWritten ?? [],
+    workspaceRoot: workspaceRoot(),
+    ledgerPath: path.join(workspaceRoot(), PROGRESS_JSON),
+    notAttempted: modules
+      .filter((module) => module.id !== spec.id && !completed.has(module.id))
+      .map((module) => module.id),
+  });
+  return new ModuleAttemptsExhausted(message, spec.id);
 }
 
 async function runModuleStage(
@@ -840,156 +905,201 @@ async function runModuleStage(
   const notes: string[] = [];
   let built = 0;
 
-  for (const spec of pending) {
+  // Labelled because the inner per-attempt loop needs to be able to stop the
+  // whole STAGE: the --max-modules cap and the run budget end the stage, while a
+  // failed verification only ends one attempt at one module.
+  moduleLoop: for (const spec of pending) {
     if (built >= maxModules) {
       notes.push(`stopped at the --max-modules cap of ${maxModules}`);
-      break;
-    }
-    if (!budget.canAfford(MIN_BUDGET_HEADROOM_USD)) {
-      notes.push(
-        `stopped before ${spec.id}: only $${budget.remaining.toFixed(4)} left of the ` +
-          `$${budget.cap.toFixed(2)} run budget, below the $${MIN_BUDGET_HEADROOM_USD.toFixed(2)} minimum`
-      );
-      aggregate.budgetHalt = true;
       break;
     }
 
     const position = modules.findIndex((m) => m.id === spec.id) + 1;
     console.log(`  --> ${spec.id} ${spec.title} (module ${position} of ${modules.length})`);
 
-    // Everything the previous failed attempt at THIS module knew, recovered
-    // from the ledger rather than from memory. That is what makes it work
-    // identically for an in-process retry (the stage retry loop re-enters this
-    // function from the top) and for a fresh process resuming after a halt.
-    const prior = await priorAttemptFor(progress, spec.id);
-    if (prior !== null) {
-      console.log(
-        `      retry: attempt ${prior.attemptNumber + 1}, informed by the ${prior.record.kind} ` +
-          `failure recorded ${prior.crossProcess ? "by an earlier process" : "earlier in this run"} ` +
-          `(${prior.filesWritten.length} file(s) of its output still present)`
-      );
-    }
-
-    const startedAt = new Date().toISOString();
-    const before = await snapshotWorkspace();
-
-    const allowanceUsd = budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE);
-    const outcome = await runQueryOnce(
-      `${stageName}/${spec.id}`,
-      definition,
-      stageName,
-      buildModulePrompt(spec, position, modules.length, [...completed], prior),
-      {
-        cwd: workspaceRoot(),
-        maxBudgetUsd: allowanceUsd,
-        // The design docs live outside the workspace cwd; this is what makes
-        // them readable at all. They are still instructed to be read-only.
-        additionalDirectories: [DOCS_DIR],
+    // ONE module, up to MAX_ATTEMPTS_PER_MODULE attempts at it, retried HERE.
+    //
+    // The retry used to happen one level up: a module failure returned
+    // `outcome: "failure"`, main() called recordRetry(stage) and re-entered this
+    // function, which re-derived the pending list and carried on. That gave the
+    // right behaviour for one module and the wrong budget for a plan — three
+    // failures spread anywhere across 53 modules exhausted
+    // MAX_RETRIES_PER_STAGE for the entire build, and because state.retries is
+    // persisted, every later run then halted on its first failure. Retrying in
+    // place means a module failure never touches the stage counter, which stays
+    // as the runaway guard for stage-LEVEL faults.
+    let moduleBuilt = false;
+    while (!moduleBuilt) {
+      if (!budget.canAfford(MIN_BUDGET_HEADROOM_USD)) {
+        notes.push(
+          `stopped before ${spec.id}: only $${budget.remaining.toFixed(4)} left of the ` +
+            `$${budget.cap.toFixed(2)} run budget, below the $${MIN_BUDGET_HEADROOM_USD.toFixed(2)} minimum`
+        );
+        aggregate.budgetHalt = true;
+        break moduleLoop;
       }
-    );
-    budget.record(outcome.costUsd);
-    aggregate.costUsd += outcome.costUsd;
-    aggregate.numTurns += outcome.numTurns;
 
-    const after = await snapshotWorkspace();
-    const written = changedFiles(before, after);
-    const reported = parseReportedProgress(outcome.text);
-
-    // The typecheck runs whatever the SDK said, because "the model reported an
-    // error" and "the code it already wrote is broken" are different facts, and
-    // the second one is the one that has to be recorded.
-    const typecheck = await typecheckWorkspace();
-    const verification = await verifyModule(spec, written, reported, typecheck);
-
-    const sdkFailure = outcome.ok ? null : `the SDK call did not succeed: ${outcome.text.slice(0, 300)}`;
-    const failureReason = sdkFailure ?? verification.failureReason;
-    const moduleOk = failureReason === null;
-
-    // Structured, so the NEXT attempt can be told what to repair. Built here
-    // rather than in the verifier because the SDK-level failure is only known
-    // at this level, and it has to be one of the kinds too — a call that died
-    // mid-write still left files behind that the next attempt must not
-    // duplicate.
-    const failureRecord: ModuleFailureRecord | undefined = moduleOk
-      ? undefined
-      : {
-          kind: sdkFailure !== null ? "sdk" : (verification.failureKind ?? "sdk"),
-          reason: failureReason,
-          // TS2307 lines are in typecheck.missingModuleWarnings, never in
-          // .errors, so this is already the filtered set. Do not "helpfully"
-          // add the warnings back: forty unresolved-import lines around one
-          // real TS2322 is how the real error gets ignored.
-          typecheckErrors: [...typecheck.errors],
-          stubFindings: verification.stub.findings.map(
-            (finding) => `${finding.file}:${finding.line} — ${finding.label}: ${finding.text}`
-          ),
-          unownedReqs: [...verification.unownedReqs],
-        };
-
-    progress = await appendProgress(progress, {
-      moduleId: spec.id,
-      title: spec.title,
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      outcome: moduleOk ? "success" : "failure",
-      filesWritten: written,
-      reqsClaimed: verification.reqsClaimed,
-      failureReason,
-      ...(failureRecord === undefined ? {} : { failure: failureRecord }),
-      deviations: reported.deviations,
-      warnings: verification.warnings,
-      costUsd: outcome.costUsd,
-      numTurns: outcome.numTurns,
-    });
-
-    for (const warning of verification.warnings) console.log(`      warning: ${warning}`);
-
-    if (!moduleOk) {
-      console.error(`      FAILED — ${failureReason}`);
-      notes.push(`${spec.id} failed: ${failureReason}`);
-      aggregate.text = notes.join("\n");
-
-      // Same split as the document stages, with the module's own verification
-      // standing in for hasRealContent: the code this call wrote may be
-      // complete and typecheck-clean even though the call itself hit its cap.
-      // The progress entry above is already written either way, so the
-      // evidence survives the halt.
-      if (outcome.deterministic !== null) {
-        const artifactOk = verification.failureReason === null && written.length > 0;
-        throw new DeterministicStageFailure(
-          buildDeterministicHaltMessage({
-            label: `${stageName}/${spec.id}`,
-            failure: outcome.deterministic,
-            costUsd: outcome.costUsd,
-            numTurns: outcome.numTurns,
-            allowanceUsd,
-            perStageCapUsd: MAX_BUDGET_USD_PER_STAGE,
-            artifact: {
-              description: `${spec.id} in ${workspaceRoot()}/`,
-              complete: artifactOk,
-              detail: artifactOk
-                ? `${written.length} file(s) written and they pass the module verification ` +
-                  `(REQs ${verification.reqsClaimed.join(", ") || "none"}, typecheck clean). ` +
-                  `Recorded as a FAILED attempt in the workspace progress ledger.`
-                : (verification.failureReason ?? `${written.length} file(s) written.`),
-            },
-            // There is no --accept-stage for one module of a multi-module
-            // stage: the stage is not finished, so accepting it would claim
-            // modules that were never built.
-            acceptCommand: null,
-          }),
-          outcome.deterministic.subtype
+      // From the LEDGER, not from a loop variable: that is what makes the budget
+      // mean the same thing for three attempts in one process and for three
+      // attempts spread over three resumed runs against the same workspace.
+      const attemptsUsed = failedAttemptCount(progress.entries, spec.id);
+      if (attemptsUsed >= MAX_ATTEMPTS_PER_MODULE) {
+        // Halts the stage instead of moving to the next module. The plan is
+        // dependency-ordered and later modules import this one, so continuing
+        // past it buys a cascade of failures at full price.
+        throw await moduleExhaustedHalt(
+          stageName,
+          spec,
+          position,
+          modules,
+          progress,
+          attemptsUsed,
+          completed
         );
       }
-      return { ...aggregate, ok: false, outcome: "failure" };
-    }
 
-    built += 1;
-    completed.add(spec.id);
-    console.log(
-      `      ok — ${written.length} file(s), ${verification.reqsClaimed.length} REQ(s), ` +
-        `$${outcome.costUsd.toFixed(4)}`
-    );
+      // Everything the previous failed attempt at THIS module knew, recovered
+      // from the ledger rather than from memory. That is what makes it work
+      // identically for a retry inside this loop and for a fresh process
+      // resuming after a halt.
+      const prior = await priorAttemptFor(progress, spec.id);
+      if (prior !== null) {
+        console.log(
+          `      retry: attempt ${attemptsUsed + 1} of ${MAX_ATTEMPTS_PER_MODULE}, informed by ` +
+            `the ${prior.record.kind} failure recorded ` +
+            `${prior.crossProcess ? "by an earlier process" : "earlier in this run"} ` +
+            `(${prior.filesWritten.length} file(s) of its output still present)`
+        );
+      }
+
+      const startedAt = new Date().toISOString();
+      const before = await snapshotWorkspace();
+
+      const allowanceUsd = budget.allowanceFor(MAX_BUDGET_USD_PER_STAGE);
+      const outcome = await runQueryOnce(
+        `${stageName}/${spec.id}`,
+        definition,
+        stageName,
+        buildModulePrompt(spec, position, modules.length, [...completed], prior),
+        {
+          cwd: workspaceRoot(),
+          maxBudgetUsd: allowanceUsd,
+          // The design docs live outside the workspace cwd; this is what makes
+          // them readable at all. They are still instructed to be read-only.
+          additionalDirectories: [DOCS_DIR],
+        }
+      );
+      budget.record(outcome.costUsd);
+      aggregate.costUsd += outcome.costUsd;
+      aggregate.numTurns += outcome.numTurns;
+
+      const after = await snapshotWorkspace();
+      const written = changedFiles(before, after);
+      const reported = parseReportedProgress(outcome.text);
+
+      // The typecheck runs whatever the SDK said, because "the model reported an
+      // error" and "the code it already wrote is broken" are different facts, and
+      // the second one is the one that has to be recorded.
+      const typecheck = await typecheckWorkspace();
+      const verification = await verifyModule(spec, written, reported, typecheck);
+
+      const sdkFailure = outcome.ok ? null : `the SDK call did not succeed: ${outcome.text.slice(0, 300)}`;
+      const failureReason = sdkFailure ?? verification.failureReason;
+      const moduleOk = failureReason === null;
+
+      // Structured, so the NEXT attempt can be told what to repair. Built here
+      // rather than in the verifier because the SDK-level failure is only known
+      // at this level, and it has to be one of the kinds too — a call that died
+      // mid-write still left files behind that the next attempt must not
+      // duplicate.
+      const failureRecord: ModuleFailureRecord | undefined = moduleOk
+        ? undefined
+        : {
+            kind: sdkFailure !== null ? "sdk" : (verification.failureKind ?? "sdk"),
+            reason: failureReason,
+            // TS2307 lines are in typecheck.missingModuleWarnings, never in
+            // .errors, so this is already the filtered set. Do not "helpfully"
+            // add the warnings back: forty unresolved-import lines around one
+            // real TS2322 is how the real error gets ignored.
+            typecheckErrors: [...typecheck.errors],
+            stubFindings: verification.stub.findings.map(
+              (finding) => `${finding.file}:${finding.line} — ${finding.label}: ${finding.text}`
+            ),
+            unownedReqs: [...verification.unownedReqs],
+          };
+
+      progress = await appendProgress(progress, {
+        moduleId: spec.id,
+        title: spec.title,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        outcome: moduleOk ? "success" : "failure",
+        filesWritten: written,
+        reqsClaimed: verification.reqsClaimed,
+        failureReason,
+        ...(failureRecord === undefined ? {} : { failure: failureRecord }),
+        deviations: reported.deviations,
+        warnings: verification.warnings,
+        costUsd: outcome.costUsd,
+        numTurns: outcome.numTurns,
+      });
+
+      for (const warning of verification.warnings) console.log(`      warning: ${warning}`);
+
+      if (!moduleOk) {
+        console.error(
+          `      FAILED (attempt ${attemptsUsed + 1} of ${MAX_ATTEMPTS_PER_MODULE}) — ${failureReason}`
+        );
+
+        // Same split as the document stages, with the module's own verification
+        // standing in for hasRealContent: the code this call wrote may be
+        // complete and typecheck-clean even though the call itself hit its cap.
+        // The progress entry above is already written either way, so the
+        // evidence survives the halt.
+        if (outcome.deterministic !== null) {
+          const artifactOk = verification.failureReason === null && written.length > 0;
+          throw new DeterministicStageFailure(
+            buildDeterministicHaltMessage({
+              label: `${stageName}/${spec.id}`,
+              failure: outcome.deterministic,
+              costUsd: outcome.costUsd,
+              numTurns: outcome.numTurns,
+              allowanceUsd,
+              perStageCapUsd: MAX_BUDGET_USD_PER_STAGE,
+              artifact: {
+                description: `${spec.id} in ${workspaceRoot()}/`,
+                complete: artifactOk,
+                detail: artifactOk
+                  ? `${written.length} file(s) written and they pass the module verification ` +
+                    `(REQs ${verification.reqsClaimed.join(", ") || "none"}, typecheck clean). ` +
+                    `Recorded as a FAILED attempt in the workspace progress ledger.`
+                  : (verification.failureReason ?? `${written.length} file(s) written.`),
+              },
+              // There is no --accept-stage for one module of a multi-module
+              // stage: the stage is not finished, so accepting it would claim
+              // modules that were never built.
+              acceptCommand: null,
+            }),
+            outcome.deterministic.subtype
+          );
+        }
+
+        // Not a stage failure and not a reason to move on: go round the while
+        // loop and attempt THIS module again, with the failure just recorded in
+        // the ledger now driving the next prompt. The budget check at the top is
+        // what ends it, either by halting (attempts used up) or by stopping the
+        // stage cleanly (run budget).
+        continue;
+      }
+
+      built += 1;
+      moduleBuilt = true;
+      completed.add(spec.id);
+      console.log(
+        `      ok — ${written.length} file(s), ${verification.reqsClaimed.length} REQ(s), ` +
+          `$${outcome.costUsd.toFixed(4)}`
+      );
+    }
   }
 
   const remaining = modules.filter((module) => !completed.has(module.id));
@@ -1922,7 +2032,10 @@ async function main(): Promise<void> {
     `Phase ${CURRENT_PHASE} runs through "${LAST_IMPLEMENTED_STAGE}", then routes feedback; ` +
       `"testing-agent" is still blocked on M18.`
   );
-  console.log(`MAX_RETRIES_PER_STAGE = ${MAX_RETRIES_PER_STAGE}`);
+  console.log(
+    `MAX_RETRIES_PER_STAGE = ${MAX_RETRIES_PER_STAGE} (stage-level failures); ` +
+      `MAX_ATTEMPTS_PER_MODULE = ${MAX_ATTEMPTS_PER_MODULE} (spec-implementer, per module)`
+  );
   console.log(
     `Run budget: $${MAX_BUDGET_USD_PER_RUN.toFixed(2)} cumulative, ` +
       `$${MAX_BUDGET_USD_PER_STAGE.toFixed(2)} per call; --max-modules ${cli.maxModules}; ` +

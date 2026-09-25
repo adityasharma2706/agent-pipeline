@@ -16,7 +16,21 @@ import type {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_FILE_PATH = path.join(__dirname, "..", "state", "run.json");
 
-/** Max times a single stage may be retried before the orchestrator must stop. */
+/**
+ * Max times a single STAGE may be retried before the orchestrator must stop.
+ *
+ * This counter is persisted in state/run.json and is deliberately not reset on
+ * load — it is the runaway guard, and a guard that forgets is not one. Only
+ * `--accept-stage` and a go-back's rewindTo() clear it.
+ *
+ * It counts stage-level failures only. A failure of ONE MODULE inside the
+ * spec-implementer loop is not charged here: that stage runs one call per module
+ * over a whole plan, so three module failures anywhere across 53 modules would
+ * otherwise exhaust the budget for the entire build and then, because the count
+ * persists, halt every later run on its first failure. Module attempts have their
+ * own per-module budget, counted in the workspace ledger — see
+ * MAX_ATTEMPTS_PER_MODULE in orchestrator/retry-context.ts.
+ */
 export const MAX_RETRIES_PER_STAGE = 3;
 
 /**
@@ -202,6 +216,12 @@ export function finishStage(
  * Records a retry attempt for a stage, enforcing MAX_RETRIES_PER_STAGE.
  * Throws once the cap would be exceeded, so the orchestrator's control loop
  * cannot silently spin forever on a broken stage.
+ *
+ * Only the control loop in main() calls this, once per stage attempt that came
+ * back as `outcome: "failure"`. The module loop does not: a module that fails
+ * verification is bounded by MAX_ATTEMPTS_PER_MODULE instead, and halts the
+ * stage itself. Genuine stage-level failures of spec-implementer still arrive
+ * here, so the runaway guard still covers it.
  */
 export function recordRetry(state: RunState, stage: PipelineStage): RunState {
   const currentCount = state.retries[stage] ?? 0;

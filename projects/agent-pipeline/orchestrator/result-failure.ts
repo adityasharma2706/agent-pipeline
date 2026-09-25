@@ -243,3 +243,163 @@ export function buildDeterministicHaltMessage(ctx: DeterministicHaltContext): st
   lines.push(``, ...remedyLines(ctx));
   return lines.join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// A module that used up its per-module attempt budget.
+//
+// Same shape and same reasoning as the deterministic halt above: stop, and spend
+// the message on telling a human something they can act on. The difference is
+// only in what ran out — a cap inside one call there, the number of calls here.
+// ---------------------------------------------------------------------------
+
+/** What the last failed attempt at the module knew. Mirrors ModuleFailureRecord. */
+export interface ModuleAttemptFailure {
+  kind: string;
+  reason: string;
+  typecheckErrors: readonly string[];
+  stubFindings: readonly string[];
+  unownedReqs: readonly string[];
+}
+
+export interface ModuleExhaustedHaltContext {
+  /** The stage running the module loop, i.e. "spec-implementer". */
+  stage: string;
+  moduleId: string;
+  moduleTitle: string;
+  /** 1-based position in the dependency-ordered plan, and the plan's size. */
+  position: number;
+  moduleCount: number;
+  /** Attempts already recorded as failures for this module, and the budget. */
+  attemptsUsed: number;
+  maxAttempts: number;
+  /** What every attempt at this module has cost, summed from the ledger. */
+  costUsd: number;
+  /** The last attempt's rejection. */
+  failure: ModuleAttemptFailure;
+  /** Workspace-relative paths the last attempt left behind, re-checked on disk. */
+  filesWritten: readonly string[];
+  /** Absolute workspace root, so the paths above can be acted on. */
+  workspaceRoot: string;
+  /** Absolute path of the ledger a human would edit to release the module. */
+  ledgerPath: string;
+  /** Module ids after this one that were not attempted. */
+  notAttempted: readonly string[];
+}
+
+/** Thrown instead of attempting a module a fourth time. main()'s catch prints it. */
+export class ModuleAttemptsExhausted extends Error {
+  readonly moduleId: string;
+
+  constructor(message: string, moduleId: string) {
+    super(message);
+    this.name = "ModuleAttemptsExhausted";
+    this.moduleId = moduleId;
+  }
+}
+
+/** Indented block of at most MAX_HALT_EVIDENCE_LINES lines, or nothing. */
+const MAX_HALT_EVIDENCE_LINES = 10;
+
+function evidenceBlock(label: string, lines: readonly string[]): string[] {
+  if (lines.length === 0) return [];
+  const shown = lines.slice(0, MAX_HALT_EVIDENCE_LINES);
+  const out = [`  ${label}`, ...shown.map((line) => `    ${line}`)];
+  if (lines.length > shown.length) {
+    out.push(`    ...and ${lines.length - shown.length} more (all of them are in the ledger)`);
+  }
+  return out;
+}
+
+/** The diagnostics of the last attempt, whichever kind it was. */
+function failureEvidence(failure: ModuleAttemptFailure): string[] {
+  return [
+    ...evidenceBlock("tsc --noEmit said:", failure.typecheckErrors),
+    ...evidenceBlock("placeholder markers found:", failure.stubFindings),
+    ...evidenceBlock(
+      "REQ IDs claimed that this module does not own:",
+      failure.unownedReqs.length > 0 ? [failure.unownedReqs.join(", ")] : []
+    ),
+  ];
+}
+
+/**
+ * The halt message for a module that failed its whole attempt budget.
+ *
+ * Verbose on purpose, for the same reason buildDeterministicHaltMessage is: the
+ * run has stopped with a partly-built product on disk, and the next thing that
+ * happens is a human deciding what to do. Everything they need to decide —
+ * which module, what it broke, which files are theirs to look at, and how to let
+ * the run continue afterwards — is here rather than in the scrollback.
+ */
+export function buildModuleExhaustedHaltMessage(ctx: ModuleExhaustedHaltContext): string {
+  const lines: string[] = [
+    `Module ${ctx.moduleId} failed ${ctx.attemptsUsed} attempt(s) and has no budget left ` +
+      `(MAX_ATTEMPTS_PER_MODULE = ${ctx.maxAttempts}). Stage "${ctx.stage}" stopped here.`,
+    ``,
+    `  module:   ${ctx.moduleId} ${ctx.moduleTitle} (module ${ctx.position} of ${ctx.moduleCount})`,
+    `  attempts: ${ctx.attemptsUsed} of ${ctx.maxAttempts}, costing ${usd(ctx.costUsd)} in total`,
+    `  rejected: ${ctx.failure.kind} — ${ctx.failure.reason.split("\n")[0] ?? ""}`,
+  ];
+
+  lines.push(...failureEvidence(ctx.failure));
+
+  if (ctx.filesWritten.length > 0) {
+    lines.push(
+      ...evidenceBlock(`files the last attempt left in ${ctx.workspaceRoot}:`, [...ctx.filesWritten])
+    );
+  } else {
+    lines.push(`  files:    the last attempt left nothing on disk to look at.`);
+  }
+
+  lines.push(
+    ``,
+    `The loop did NOT move on to the next module. docs/implementer.md is dependency-ordered`,
+    `and later modules import this one, so building on top of a module that never passed`,
+    `verification buys a cascade of failures at full price.`
+  );
+
+  if (ctx.notAttempted.length > 0) {
+    const shown = ctx.notAttempted.slice(0, 8).join(", ");
+    const elided = ctx.notAttempted.length > 8 ? `, ... (${ctx.notAttempted.length} in all)` : ".";
+    lines.push(`${ctx.notAttempted.length} module(s) were therefore not attempted: ${shown}${elided}`);
+  }
+
+  lines.push(
+    ``,
+    `Attempts 2 and ${ctx.maxAttempts} were INFORMED — each was given the previous attempt's exact`,
+    `diagnostics and told to repair its own files (orchestrator/retry-context.ts). They still`,
+    `did not converge, so another identical-in-spirit attempt is money spent on the same`,
+    `outcome. This is the point where a human is cheaper than the model.`,
+    ``,
+    `WHAT YOU CAN DO, cheapest first:`,
+    ``,
+    `1. Fix the files yourself, in the workspace. They are listed above and are real code,`,
+    `   not a draft — the rest of the module passed every check that is not named above.`,
+    `   The workspace has no node_modules, so unresolved-import errors in your editor are`,
+    `   expected and are not what failed.`,
+    `   Then mark the attempt good, by editing the LAST ${ctx.moduleId} entry in:`,
+    ``,
+    `     ${ctx.ledgerPath}`,
+    ``,
+    `   ...setting its "outcome" to "success". The next run skips ${ctx.moduleId} and continues`,
+    `   from the module after it. You are vouching for code the verifier rejected, so run`,
+    `   \`npx tsc --noEmit\` in the workspace yourself first.`,
+    ``,
+    `2. Give it a fresh budget, if you believe the failures were flukes rather than a`,
+    `   systematic problem: delete the failed ${ctx.moduleId} entries from the same ledger and`,
+    `   re-run. That costs another ${ctx.maxAttempts} attempts at full price, which is why it is`,
+    `   not the first option and is not done automatically.`,
+    ``,
+    `3. Investigate the spec, if the module is being asked for something it cannot do —`,
+    `   a dependency its \`Depends on:\` line does not name, a REQ that belongs elsewhere,`,
+    `   a design the plan never settled. Read the ${ctx.moduleId} section of docs/implementer.md`,
+    `   against the diagnostics above. If the plan is wrong, no number of retries fixes it,`,
+    `   and the repair is a go-back to implementation-planning rather than another build.`,
+    ``,
+    `Nothing was lost. Every module that passed is recorded in the ledger and will be`,
+    `skipped, not rebuilt, and the stage retry budget in state/run.json was NOT spent on`,
+    `this — a module failing is not the stage failing.`
+  );
+
+  return lines.join("\n");
+}

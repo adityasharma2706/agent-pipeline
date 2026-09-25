@@ -234,11 +234,11 @@ to halt the run. What counts as a retryable failure is a deliberate split:
 - *Retryable* (returned as `ok: false`, `outcome: "failure"`): an
   `error_during_execution` SDK result, an error thrown by the SDK while
   streaming (network/transport/auth), a stream that ends with no result
-  message, a stage
-  that claims success without writing its output doc, and any module that fails
-  one of `spec-implementer`'s four verification checks. A retry re-attempts only
-  the failed module — completed ones are skipped — and it is **told what went
-  wrong**; see *Informed retries* below.
+  message, and a stage
+  that claims success without writing its output doc. A module that fails one of
+  `spec-implementer`'s four verification checks is also retried, and is **told
+  what went wrong** (see *Informed retries* below) — but on its own budget, not
+  the stage's; see *Two retry budgets* immediately below.
 - *Not a failure at all* (`outcome: "partial"`): the module cap or the run
   budget stopped the work. No retry is spent.
 - *Not retryable* (thrown, halts immediately): a missing `STAGE_IO` entry, a
@@ -250,6 +250,57 @@ to halt the run. What counts as a retryable failure is a deliberate split:
 Halts print `Run halted: <message>` rather than a stack dump; set
 `PIPELINE_DEBUG=1` for the stack.
 
+### Two retry budgets: per stage, and per module
+
+There are two, and they count different things. The distinction exists because
+one stage is not like the others.
+
+| budget | value | where it lives | what it counts | who enforces it |
+| --- | --- | --- | --- | --- |
+| `MAX_RETRIES_PER_STAGE` | 3 | `state.retries[stage]` in `state/run.json` — **persisted, never auto-reset** | attempts at a whole *stage* | `recordRetry` (`orchestrator/state.ts`), called only by the control loop in `main()` |
+| `MAX_ATTEMPTS_PER_MODULE` | 3 | the workspace ledger (`pipeline-progress.json`), counted by `failedAttemptCount` | attempts at *one module* of `spec-implementer` | the module loop itself (`runModuleStage`) |
+
+For the eight document stages the stage budget is the only one that applies, and
+it is the right shape: one stage, one call, one artifact, three attempts.
+
+For `spec-implementer` it was the wrong shape, and expensively so. That stage is
+a loop over every module in `docs/implementer.md` — 53 in the current plan — and
+a module failing verification used to be reported as a *stage* failure. Three
+failures spread anywhere across 53 modules therefore exhausted the budget for the
+entire build; and because `state.retries` is persisted and only `--accept-stage`
+clears it, every subsequent run then halted on its *first* module failure with no
+attempts left at all. A 53-module build was not survivable.
+
+So module failures are now retried inside the module loop, against a per-module
+budget, and **never touch `state.retries["spec-implementer"]`**. The stage
+counter still covers genuine stage-*level* faults there (an SDK failure outside a
+module, a run that ends with the stage unfinished), so the runaway guard survives
+— it is simply no longer spent on the wrong thing.
+
+The count lives in the **ledger** rather than in `state/run.json` or in memory,
+for the same reason the failure records do: the files the attempts left behind
+are in the workspace, so the count of attempts at them belongs next to them and
+to the diagnostics that describe them. One read of one file tells a resumed run
+both *what* broke and *how many times*, and a module can never be charged for
+attempts made against a different workspace. A recorded success resets the count,
+which is what keeps a go-back safe: a module rebuilt against a revised plan starts
+from a full budget, because the old failures were against different input.
+
+**When a module exhausts its budget the stage halts — it does not move on.**
+`docs/implementer.md` is dependency-ordered and later modules import earlier
+ones, so carrying on past a broken `M05` buys a cascade of failures at full
+price. The halt
+(`buildModuleExhaustedHaltMessage`, `orchestrator/result-failure.ts`, same idiom
+as the deterministic halt below) names the module and its position in the plan,
+what the last attempt was rejected for with the verbatim diagnostics, what the
+three attempts cost in total, the files it left in the workspace, how many
+modules were consequently not attempted, and three ranked things a human can do:
+repair the files by hand and mark that ledger entry `"outcome": "success"` (the
+only way to accept code the verifier rejected, and deliberately a manual edit),
+delete the module's failed ledger entries to buy another three attempts, or read
+the module's section of the plan against the diagnostics — because if the spec is
+wrong, no number of retries fixes it and the repair is a go-back.
+
 ### Deterministic failures (and why a cap failure is never retried)
 
 The SDK's error result subtypes are not interchangeable
@@ -258,7 +309,7 @@ SDK for types only, so it can be exercised without an API key):
 
 | subtype | retried? | why |
 | --- | --- | --- |
-| `error_during_execution` | yes, up to `MAX_RETRIES_PER_STAGE` | may genuinely be transient — a network blip, a transport error |
+| `error_during_execution` | yes, up to `MAX_RETRIES_PER_STAGE` (or `MAX_ATTEMPTS_PER_MODULE` inside the module loop) | may genuinely be transient — a network blip, a transport error |
 | `error_max_budget_usd` | **no** | the same prompt against the same `maxBudgetUsd` exhausts the cap again |
 | `error_max_turns` | **no** | same reason: the identical call runs out of turns at the identical point |
 | `error_max_structured_output_retries` | **no** | the SDK already retried internally; the schema or the agent has to change |
@@ -419,7 +470,7 @@ this was the single most expensive bug in the pipeline. `buildModulePrompt` took
 no failure parameter, so a module retried after a verification failure received a
 **byte-identical prompt**. The orchestrator knew exactly what was wrong — it had
 the `tsc` diagnostics in its hand — and discarded them, so the agent re-rolled
-blind at full price up to `MAX_RETRIES_PER_STAGE` times. One live run paid $2.29
+blind at full price for every attempt in its budget. One live run paid $2.29
 to build `M01` and produced this:
 
 ```
@@ -779,9 +830,11 @@ agent-pipeline/
                    retry-context.ts
                                 what a retried module is told about its own
                                 previous attempt: failure kinds, the filtered
-                                diagnostics, the per-kind remedy. Also no SDK
-                                import, and no import of progress.ts/verify.ts
-                                (both depend on it).
+                                diagnostics, the per-kind remedy. Also owns
+                                MAX_ATTEMPTS_PER_MODULE and counts a module's
+                                attempts out of the ledger. No SDK import, and
+                                no import of progress.ts/verify.ts (both
+                                depend on it).
                    router.ts    the router contract: output schema, runtime
                                 validation, the confidence gate, planDrain.
                                 PURE — no SDK import, so the gate can be
@@ -789,8 +842,10 @@ agent-pipeline/
                    routing.ts   the append-only routing log + RD-n allocation
                    result-failure.ts
                                 deterministic vs transient SDK result
-                                subtypes, and the halt message that reports
-                                what a capped call still managed to write.
+                                subtypes, the halt message that reports what
+                                a capped call still managed to write, and the
+                                halt for a module that used up its per-module
+                                attempt budget.
                                 Type-only SDK import, so it too can be
                                 exercised without a billable call.
   setup.sh         idempotent bootstrap
