@@ -63,7 +63,11 @@ visible instead of silent.
 > malformed `state/run.json`, the config-fault halt (missing
 > `agents/<stage>.md`); for Phase 4, module parsing against the real
 > `docs/implementer.md` (36 modules, none hardcoded), idempotent workspace
-> bootstrap, the TS2307-vs-error classifier, the typecheck verifier against
+> bootstrap, the TS2307-vs-error classifier in both dependency states (warning
+> while nothing is installed, module failure for an undeclared import once
+> `npm install --ignore-scripts` has succeeded, proven against a real install in
+> a throwaway workspace), the dependency-set hash skipping an unchanged
+> reinstall, an install failure falling back cleanly, the typecheck verifier against
 > hand-written good and broken files, every stub-detector rule, the REQ-subset
 > check, progress-log round-tripping and resume, and the cumulative budget
 > halting before it starts a call it cannot pay for; and for Phase 5, 78
@@ -132,6 +136,20 @@ npm run orchestrator -- --max-modules 5
 It is a cap, not a truncation: modules recorded as complete in the workspace
 progress log are skipped, so re-running continues where the last run stopped
 rather than rebuilding.
+
+**`--no-install`** stops the orchestrator installing the workspace's declared
+dependencies before each typecheck:
+
+```
+npm run orchestrator -- --no-install
+```
+
+Installs are **on** by default, run as `npm install --ignore-scripts` with the
+workspace as `cwd`, and log every package name and version first. `--no-install`
+exists because that package list is written by a model; declining it is safe and
+costs only verification coverage — unresolved imports stay warnings, so the
+typecheck cannot see inside any file that imports a third-party package. See
+*Workspace dependencies* under the spec-implementer stage.
 
 The default was **2** through Phase 4, when the first live runs of a loop that
 writes real code had to be cheap enough to throw away. It has done that job.
@@ -385,9 +403,11 @@ substitute for Bash is provided.
 Three consequences, all handled on the orchestrator side rather than worked
 around on the agent side:
 
-- **Nothing is installed.** The agent cannot run `npm install`, so generated
-  imports do not resolve. The typecheck verifier treats `TS2307: Cannot find
-  module` as a logged warning rather than a failure.
+- **The agent cannot install anything.** So the *orchestrator* installs the
+  dependencies the agent declared, before each typecheck — see *Workspace
+  dependencies* below. Until that has succeeded, `TS2307: Cannot find module` is
+  a logged warning rather than a failure; once it has, the same diagnostic
+  becomes a failure, because it now means an **undeclared** import.
 - **The agent cannot verify its own work.** So the orchestrator runs the
   typecheck itself. Success is never the agent's self-report.
 - **`testing-agent` cannot ship before M18.** It needs Playwright, i.e. a
@@ -406,10 +426,59 @@ not the agent, on first use: it creates the directory, a `package.json`, a
 so the product has its own history. It is idempotent — an existing workspace is
 never clobbered, and `setup.sh` never touches it.
 
-That workspace `tsconfig.json` points `typeRoots` at *this* repo's installed
-`@types` and includes the `DOM` lib. Without it, every generated file touching
-`process`/`console` would fail on `TS2304: cannot find name` — an artefact of
-the empty `node_modules`, nothing to do with the module being judged.
+That workspace `tsconfig.json` points `typeRoots` at the workspace's own
+`node_modules/@types` *and* at **this** repo's installed `@types`, and includes
+the `DOM` lib. Without this repo's copy, every generated file touching
+`process`/`console` would fail on `TS2304: cannot find name` before anything is
+installed — an artefact of an empty `node_modules`, nothing to do with the
+module being judged.
+
+**Workspace dependencies: the orchestrator installs them** (`orchestrator/deps.ts`).
+
+Leaving `node_modules` empty had a cost that was invisible because it looked
+like a warning: **TypeScript cannot check anything in a file whose imports it
+cannot resolve.** On the first live run, M01 ("Platform foundation" — db, redis,
+S3, secrets, telemetry, i.e. almost entirely third-party integration) was
+therefore verified almost not at all; across three attempts the only errors that
+surfaced were on local `./types.js` / `./errors.js` imports. So after a module's
+call returns and **before** the typecheck, the orchestrator runs the install
+itself. It is trusted code — the same argument that already justifies it running
+`tsc`.
+
+- **What gets installed:** exactly the `dependencies` + `devDependencies` the
+  agent wrote into the workspace `package.json`. Nothing is added, pinned or
+  substituted by the orchestrator, and every name and version range is
+  **printed to the run log before the install runs**, so a human can see what a
+  model decided to pull in.
+- **`npm install --ignore-scripts`, always.** This is the whole basis on which
+  this is acceptable: the package list was chosen by a model, and with npm
+  lifecycle scripts disabled (`preinstall`/`install`/`postinstall`/`prepare`),
+  **no code from any installed package is ever executed** — nothing runs the
+  generated product, and `tsc --noEmit` only parses `.d.ts` declarations. The
+  flag is load-bearing, not tidy-up: removing it turns a model-chosen package
+  name into arbitrary code execution on the machine. There is a comment in
+  `deps.ts` saying so.
+- **Scoped to the workspace.** The install runs with `$PIPELINE_WORKSPACE` as
+  `cwd`, never this repo.
+- **Only when the dependency set changed.** `deps.ts` hashes the sorted
+  `dependencies` + `devDependencies` objects and stores that hash in
+  `$PIPELINE_WORKSPACE/.pipeline-install-state.json` after a *successful*
+  install (the workspace is the natural home — the resume ledger already lives
+  there). While the hash matches and `node_modules` is present, the install is
+  skipped. Reformatting `package.json` does not trigger a reinstall; adding,
+  removing or re-ranging a package does.
+- **A failed install never fails the module.** No network, a registry error, a
+  package name the model invented, a hanging install (5-minute timeout) — each
+  is logged plainly and falls through to the pre-existing behaviour, where
+  `TS2307` stays a warning. A dependency install failing is not the agent
+  writing bad code, and must not be recorded as if it were.
+- **`--no-install` turns it off**, for anyone who does not want model-chosen
+  packages fetched onto their machine. It is a real supported choice and costs
+  verification coverage, not safety; the run header says which mode is active.
+
+**`.pipeline-install-state.json`** is orchestrator bookkeeping, excluded from
+"files the agent wrote" alongside the progress ledger, and the workspace
+`.gitignore` created at bootstrap covers `node_modules/`.
 
 **The module loop.** `docs/implementer.md` is parsed for its `### Mnn Title`
 sections, with the `**Depends on:**` and `**REQs:**` lines beneath each. The
@@ -433,11 +502,26 @@ stopping at the first failure:
    A module inventing requirement IDs is a red flag, not a rounding error.
 3. **Not a stub** — see below.
 4. **`tsc --noEmit` is clean.** The orchestrator runs TypeScript against the
-   whole workspace and requires exit 0, with one exception: `TS2307` is logged
-   as a warning, because it means "this dependency was never installed", which
-   is guaranteed rather than informative. *Every other diagnostic code fails the
-   module.* That split is the whole verifier: downgrade too much and it proves
-   nothing, downgrade too little and every module fails on missing `node_modules`.
+   whole workspace and requires exit 0. Every diagnostic code fails the module,
+   with one state-dependent exception — `TS2307: Cannot find module`:
+
+   - **If a dependency install has *not* succeeded** for the currently declared
+     set (`--no-install`, the install failed, or `package.json` declares
+     nothing), `TS2307` is logged as a warning with the reason, because it means
+     "this dependency was never installed" — guaranteed rather than
+     informative. Downgrade too little here and every module fails on a missing
+     `node_modules`.
+   - **If a dependency install *has* succeeded** for the currently declared set,
+     every declared package is on disk, so a remaining `TS2307` means the agent
+     **imported a package it never added to `package.json`**. That is a real
+     defect the verifier previously could not see, and the one an agent is most
+     likely to make once imports start resolving, so it **fails the module**,
+     with a message that says exactly that rather than "fix the type error".
+
+   Which of the two states applies is decided in exactly one place — the
+   `dependenciesResolved` flag returned by `deps.ts` — and never re-derived
+   elsewhere. Getting it backwards either fails every module or makes the
+   typecheck verifier useless.
 
 **What the stub detector actually catches.** "It wrote files" is trivially
 satisfiable, and the cheapest way to satisfy it is a placeholder, so this check
@@ -486,11 +570,14 @@ Now every rejection is classified, recorded, and rendered into the *next*
 attempt's prompt as a clearly-marked leading section (`orchestrator/retry-context.ts`):
 
 - **The real diagnostics, verbatim** — file, line, code, message. **TS2307
-  unresolved-import lines are excluded and must stay excluded.** The workspace
-  has no `node_modules` and the agent has no shell, so every import of anything
-  produces one; forty of them around one real `TS2322` is how the real error gets
-  ignored. `classifyTypecheck` already separates the two buckets, and the retry
-  context reuses that split rather than re-deriving it.
+  unresolved-import lines are excluded while nothing is installed, and must stay
+  excluded.** With an empty `node_modules`, every import of anything produces
+  one; forty of them around one real `TS2322` is how the real error gets
+  ignored. `classifyTypecheck` separates the two buckets and the retry context
+  reuses that split rather than re-deriving it. Once a dependency install has
+  succeeded, the surviving `TS2307` lines are *promoted* into this set by the
+  verifier — at that point they are undeclared-dependency defects, and a retried
+  agent that is not told which import it failed to declare cannot fix it.
 - **A per-kind remedy.** The five kinds (`typecheck`, `stub`, `req-claim`,
   `no-files`, `sdk`) are kept apart because the instructions are not
   interchangeable: "go to line 131 and fix that type error, do not rewrite the
@@ -821,6 +908,10 @@ agent-pipeline/
                    budget.ts    cumulative run budget
                    modules.ts   docs/implementer.md module parser
                    workspace.ts workspace bootstrap, snapshots, typecheck
+                   deps.ts      `npm install --ignore-scripts` of the deps the
+                                agent declared, hashed so it runs only when the
+                                set changes. Never throws: a failed install
+                                falls back to TS2307-as-warning.
                    verify.ts    per-module verification + stub detection
                    progress.ts  the workspace progress log / resume ledger
                    module-prompt.ts

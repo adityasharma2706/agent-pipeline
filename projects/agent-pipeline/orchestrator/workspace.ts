@@ -8,8 +8,9 @@
 // its own git history, overridable with PIPELINE_WORKSPACE.
 //
 // Everything here is orchestrator-side. The agent has no shell (see
-// agents/spec-implementer.md and docs/lld.md LD-1), so bootstrapping, git and
-// typechecking are all run by this process, never by the agent.
+// agents/spec-implementer.md and docs/lld.md LD-1), so bootstrapping, git,
+// dependency installation (orchestrator/deps.ts) and typechecking are all run by
+// this process, never by the agent.
 
 import { execFile } from "node:child_process";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -29,6 +30,14 @@ const IGNORED_DIRS = new Set([".git", "node_modules", "dist", ".next", "build", 
 /** Orchestrator-owned bookkeeping files; not part of the generated product. */
 export const PROGRESS_JSON = "pipeline-progress.json";
 export const PROGRESS_MD = "PROGRESS.md";
+/**
+ * Where orchestrator/deps.ts records the hash of the last dependency set it
+ * successfully installed. Lives in the workspace because that is what the fact
+ * is about — this workspace's `node_modules` — and is excluded from
+ * `changedFiles()` like the other two, so it can never be mistaken for output
+ * the agent wrote.
+ */
+export const INSTALL_STATE_FILE = ".pipeline-install-state.json";
 
 /**
  * Where generated code goes. Resolved once per process so every caller agrees,
@@ -44,17 +53,23 @@ export function workspaceRoot(): string {
 /**
  * The workspace tsconfig.
  *
- * Two non-obvious choices, both forced by the same fact — the workspace has no
- * `node_modules`, because the agent has no shell to run `npm install` with:
+ * Two non-obvious choices, both forced by the same fact — the agent has no
+ * shell, so it can never run `npm install` itself:
  *
- *  - `typeRoots` points at THIS repo's installed `@types`. Without it, every
- *    generated file that touches `process`/`Buffer`/`console` fails on
- *    TS2304 "cannot find name", which would make the typecheck verifier reject
- *    every module for a reason that has nothing to do with the module.
+ *  - `typeRoots` lists THIS repo's installed `@types` alongside the workspace's
+ *    own `node_modules/@types`. Without this repo's copy, every generated file
+ *    that touches `process`/`Buffer`/`console` fails on TS2304 "cannot find
+ *    name" before any dependency install has happened, which would make the
+ *    typecheck verifier reject every module for a reason that has nothing to do
+ *    with the module. The workspace's own entry comes first so a `@types/node`
+ *    the generated product actually declared wins over this repo's version.
  *  - `lib` includes DOM for the same reason on the browser side.
  *
- * Unresolved third-party imports still surface, as TS2307 — which is exactly
- * the diagnostic the verifier downgrades to a warning (see classifyTypecheck).
+ * Third-party imports resolve only once orchestrator/deps.ts has installed the
+ * dependencies the agent declared in package.json. Until then they surface as
+ * TS2307, which the verifier downgrades to a warning; after a successful
+ * install a TS2307 means an UNDECLARED import and fails the module. See
+ * classifyTypecheck and verifyModule.
  */
 function workspaceTsconfig(): string {
   const typeRoots = path.join(PROJECT_ROOT, "node_modules", "@types");
@@ -72,7 +87,7 @@ function workspaceTsconfig(): string {
         allowSyntheticDefaultImports: true,
         forceConsistentCasingInFileNames: true,
         resolveJsonModule: true,
-        typeRoots: [typeRoots],
+        typeRoots: ["./node_modules/@types", typeRoots],
       },
       include: ["**/*.ts", "**/*.tsx"],
       exclude: ["node_modules", "dist"],
@@ -140,7 +155,12 @@ export async function ensureWorkspace(): Promise<WorkspaceBootstrapReport> {
   if (await writeIfAbsent(path.join(root, "tsconfig.json"), workspaceTsconfig())) {
     created.push("tsconfig.json");
   }
-  if (await writeIfAbsent(path.join(root, ".gitignore"), "node_modules/\ndist/\n")) {
+  // node_modules/ must stay ignored: orchestrator/deps.ts installs the
+  // dependencies the agent declared into the workspace, and committing a
+  // model-chosen dependency tree into the generated product's history is not
+  // something anyone asked for.
+  const gitignore = "node_modules/\ndist/\n";
+  if (await writeIfAbsent(path.join(root, ".gitignore"), gitignore)) {
     created.push(".gitignore");
   }
 
@@ -196,14 +216,15 @@ export async function snapshotWorkspace(): Promise<WorkspaceSnapshot> {
 
 /**
  * Files created or modified between two snapshots, as workspace-relative paths.
- * Orchestrator bookkeeping files are excluded so they can never be mistaken for
- * the agent's output. Deletions are ignored: the question this answers is
+ * Orchestrator bookkeeping files — the ledger, PROGRESS.md and the dependency
+ * install state — are excluded so they can never be mistaken for the agent's
+ * output. Deletions are ignored: the question this answers is
  * "did this call write anything", not "what changed".
  */
 export function changedFiles(before: WorkspaceSnapshot, after: WorkspaceSnapshot): string[] {
   const changed: string[] = [];
   for (const [file, fingerprint] of after) {
-    if (file === PROGRESS_JSON || file === PROGRESS_MD) continue;
+    if (file === PROGRESS_JSON || file === PROGRESS_MD || file === INSTALL_STATE_FILE) continue;
     if (before.get(file) !== fingerprint) changed.push(file);
   }
   return changed.sort();
@@ -226,11 +247,13 @@ const DIAGNOSTIC_RE = /error TS(\d+):/;
 /**
  * Splits tsc output into "missing dependency" noise and real errors.
  *
- * TS2307 ("Cannot find module X or its corresponding type declarations") is the
- * expected consequence of a workspace with no `node_modules` — the agent has no
- * shell, so nothing was ever installed. Failing a module for it would fail
- * every module that imports anything, making the verifier useless. Every other
- * diagnostic code is a genuine defect in generated code and fails the module.
+ * TS2307 ("Cannot find module X or its corresponding type declarations") gets
+ * its own bucket because its MEANING depends on whether a dependency install has
+ * succeeded, which this function has no business knowing. Unresolved-import
+ * lines are separated here; verifyModule decides whether they are the expected
+ * consequence of an uninstalled workspace (a warning) or an import the agent
+ * never declared in package.json (a failure). Every other diagnostic code is a
+ * genuine defect in generated code and fails the module unconditionally.
  *
  * Only lines containing `error TS<number>:` are classified; tsc's indented
  * continuation lines are left in `raw` and counted against neither bucket.
@@ -250,9 +273,11 @@ export function classifyTypecheck(exitCode: number, output: string): TypecheckRe
 }
 
 /**
- * Runs `tsc --noEmit` against the workspace, using this repo's TypeScript (the
- * workspace has no node_modules of its own). This is the orchestrator's own
- * check — success is never the agent's self-report.
+ * Runs `tsc --noEmit` against the workspace, using this repo's TypeScript
+ * binary (the workspace's own `node_modules`, when deps.ts has populated it,
+ * holds the generated product's dependencies, not a compiler we want to run).
+ * This is the orchestrator's own check — success is never the agent's
+ * self-report.
  */
 export async function typecheckWorkspace(): Promise<TypecheckResult> {
   const root = workspaceRoot();

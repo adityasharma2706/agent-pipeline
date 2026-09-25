@@ -5,6 +5,7 @@
 // satisfy it is a stub. So each module is judged on four orthogonal checks
 // (files written, typecheck, stub density, REQ scope), all run by this process.
 
+import type { InstallOutcome } from "./deps.js";
 import type { ModuleSpec } from "./modules.js";
 import type { ModuleFailureKind } from "./retry-context.js";
 import { readWorkspaceFile } from "./workspace.js";
@@ -242,21 +243,83 @@ export interface ModuleVerification {
   unownedReqs: string[];
   /** Non-fatal observations worth recording (missing deps, absent report). */
   warnings: string[];
+  /**
+   * The typecheck diagnostics that COUNT for this module: always
+   * `typecheck.errors`, plus the TS2307 lines when a dependency install has
+   * succeeded for the currently declared set. Callers that record the failure
+   * for the next attempt must use this rather than `typecheck.errors`, or the
+   * retried agent is never told which import it failed to declare.
+   */
+  typecheckErrors: string[];
+  /**
+   * TS2307 lines promoted to errors because the packages ARE installed, i.e.
+   * imports of things absent from package.json. Empty whenever no install has
+   * succeeded.
+   */
+  undeclaredImports: string[];
   filesWritten: string[];
   reqsClaimed: string[];
   stub: StubReport;
   typecheck: TypecheckResult;
 }
 
+/** What orchestrator/deps.ts concluded about the workspace's dependencies. */
+export type DependencyState = Pick<InstallOutcome, "dependenciesResolved" | "status">;
+
+/** No install has succeeded: TS2307 keeps its original warning treatment. */
+export const NO_DEPENDENCY_INSTALL: DependencyState = {
+  dependenciesResolved: false,
+  status: "disabled",
+};
+
+/**
+ * Why an unresolved import is being tolerated, in the words of the actual
+ * reason. "nothing is installed" was true when installing was impossible; now
+ * there are four distinct ways to arrive here, and a human reading the ledger
+ * needs to know whether they turned installs off or the registry was down.
+ */
+function unresolvedImportsAreExpectedBecause(status: DependencyState["status"]): string {
+  switch (status) {
+    case "disabled":
+      return "dependency installs are off via --no-install";
+    case "failed":
+      return "the dependency install failed, so nothing is installed";
+    case "no-dependencies":
+      return "the workspace package.json declares no dependencies";
+    case "no-manifest":
+      return "the workspace has no readable package.json";
+    default:
+      // Unreachable: "installed"/"unchanged" mean dependenciesResolved is true,
+      // and this function is only called when it is false. Kept total rather
+      // than thrown, because a wrong warning string must never end a run.
+      return "no dependency install has succeeded";
+  }
+}
+
 /**
  * Applies the four checks in cheapest-first order and stops at the first
  * failure, so the recorded reason is the actual one rather than a pile.
+ *
+ * `deps` decides what an unresolved import MEANS, and it is the one place that
+ * decision is made:
+ *
+ *  - `dependenciesResolved: false` (install disabled, failed, never run, or
+ *    package.json declares nothing) — TS2307 is the expected consequence of an
+ *    empty `node_modules` and stays a warning, exactly as before this parameter
+ *    existed. The default argument preserves that behaviour for any caller that
+ *    does not install.
+ *  - `dependenciesResolved: true` — `npm install --ignore-scripts` succeeded for
+ *    the dependency set currently declared in package.json, so every declared
+ *    package is on disk. A remaining TS2307 therefore means the agent imported
+ *    something it never declared: a real defect, and the one it is most likely
+ *    to make once imports start resolving. It fails the module.
  */
 export async function verifyModule(
   spec: ModuleSpec,
   filesWritten: string[],
   reported: ReportedProgress,
-  typecheck: TypecheckResult
+  typecheck: TypecheckResult,
+  deps: DependencyState = NO_DEPENDENCY_INSTALL
 ): Promise<ModuleVerification> {
   const warnings: string[] = [];
   if (!reported.found) {
@@ -264,9 +327,19 @@ export async function verifyModule(
       "agent did not emit a PIPELINE-PROGRESS block, so its REQ claims and deviation notes are unknown"
     );
   }
-  for (const warning of typecheck.missingModuleWarnings) {
-    warnings.push(`unresolved import (expected — nothing is installed): ${warning}`);
+
+  // Exactly one of these two branches runs, and which one is decided solely by
+  // deps.dependenciesResolved. Never both: an unresolved import is either
+  // expected noise or a declaration bug, and reporting it as both would put the
+  // same line in the warnings and in the failure reason.
+  const undeclaredImports = deps.dependenciesResolved ? [...typecheck.missingModuleWarnings] : [];
+  if (!deps.dependenciesResolved) {
+    const why = unresolvedImportsAreExpectedBecause(deps.status);
+    for (const warning of typecheck.missingModuleWarnings) {
+      warnings.push(`unresolved import (expected — ${why}): ${warning}`);
+    }
   }
+  const typecheckErrors = [...typecheck.errors, ...undeclaredImports];
 
   const empty: StubReport = {
     isStub: false,
@@ -280,6 +353,8 @@ export async function verifyModule(
     filesWritten,
     reqsClaimed: reported.reqs,
     typecheck,
+    typecheckErrors,
+    undeclaredImports,
     unownedReqs: [] as string[],
   };
 
@@ -322,15 +397,26 @@ export async function verifyModule(
   }
 
   // 4. Does the whole workspace still typecheck?
-  if (typecheck.errors.length > 0) {
-    const shown = typecheck.errors.slice(0, 5).join("\n      ");
-    const more = typecheck.errors.length > 5 ? `\n      ...and ${typecheck.errors.length - 5} more` : "";
+  if (typecheckErrors.length > 0) {
+    const shown = typecheckErrors.slice(0, 5).join("\n      ");
+    const more = typecheckErrors.length > 5 ? `\n      ...and ${typecheckErrors.length - 5} more` : "";
+    // Named separately because the remedy is different and specific: the agent
+    // does not need to change the import, it needs to add the package to
+    // package.json. A generic "tsc reported errors" would send it editing code
+    // that is probably correct.
+    const undeclaredNote =
+      undeclaredImports.length === 0
+        ? ""
+        : `\n      ${undeclaredImports.length} of these are imports of packages that are NOT in ` +
+          `the workspace package.json — the declared dependencies installed successfully, so ` +
+          `these modules are genuinely missing a dependency declaration, not merely uninstalled.`;
     return {
       ...base,
       stub,
       ok: false,
       failureKind: "typecheck",
-      failureReason: `tsc --noEmit reported ${typecheck.errors.length} error(s):\n      ${shown}${more}`,
+      failureReason:
+        `tsc --noEmit reported ${typecheckErrors.length} error(s):\n      ${shown}${more}${undeclaredNote}`,
     };
   }
 

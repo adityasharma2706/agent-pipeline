@@ -75,6 +75,7 @@ import {
 } from "./router.js";
 import { appendRoutingEntry, loadRoutingLog, nextRoutingDecisionId, routingLogPath } from "./routing.js";
 import { MAX_BUDGET_USD_PER_RUN, RunBudget } from "./budget.js";
+import { installWorkspaceDependencies } from "./deps.js";
 import { loadModules } from "./modules.js";
 import type { ModuleSpec } from "./modules.js";
 import {
@@ -858,7 +859,8 @@ async function runModuleStage(
   stageName: PipelineStage,
   definition: AgentDefinition,
   budget: RunBudget,
-  maxModules: number
+  maxModules: number,
+  installDeps: boolean
 ): Promise<StageResult> {
   const bootstrap = await ensureWorkspace();
   console.log(`  workspace: ${bootstrap.root}`);
@@ -997,11 +999,19 @@ async function runModuleStage(
       const written = changedFiles(before, after);
       const reported = parseReportedProgress(outcome.text);
 
+      // Dependencies FIRST, then the typecheck. This is the moment package.json
+      // may have just gained entries, and a `tsc` run against a workspace whose
+      // imports cannot resolve checks almost nothing in the files that matter.
+      // Never fatal: `installWorkspaceDependencies` does not throw, and a failed
+      // install just leaves unresolved imports as warnings, exactly as before.
+      const deps = await installWorkspaceDependencies({ enabled: installDeps });
+      for (const line of deps.log) console.log(`      ${line}`);
+
       // The typecheck runs whatever the SDK said, because "the model reported an
       // error" and "the code it already wrote is broken" are different facts, and
       // the second one is the one that has to be recorded.
       const typecheck = await typecheckWorkspace();
-      const verification = await verifyModule(spec, written, reported, typecheck);
+      const verification = await verifyModule(spec, written, reported, typecheck, deps);
 
       const sdkFailure = outcome.ok ? null : `the SDK call did not succeed: ${outcome.text.slice(0, 300)}`;
       const failureReason = sdkFailure ?? verification.failureReason;
@@ -1017,11 +1027,14 @@ async function runModuleStage(
         : {
             kind: sdkFailure !== null ? "sdk" : (verification.failureKind ?? "sdk"),
             reason: failureReason,
-            // TS2307 lines are in typecheck.missingModuleWarnings, never in
-            // .errors, so this is already the filtered set. Do not "helpfully"
-            // add the warnings back: forty unresolved-import lines around one
-            // real TS2322 is how the real error gets ignored.
-            typecheckErrors: [...typecheck.errors],
+            // verification.typecheckErrors, NOT typecheck.errors: it is the set
+            // that actually counted, i.e. the real diagnostics plus the TS2307
+            // lines promoted to errors because the packages were installed and
+            // the import was therefore undeclared. Do not "helpfully" add
+            // typecheck.missingModuleWarnings back when no install succeeded:
+            // forty unresolved-import lines around one real TS2322 is how the
+            // real error gets ignored.
+            typecheckErrors: [...verification.typecheckErrors],
             stubFindings: verification.stub.findings.map(
               (finding) => `${finding.file}:${finding.line} — ${finding.label}: ${finding.text}`
             ),
@@ -1131,7 +1144,8 @@ async function runModuleStage(
 async function runStage(
   stageName: PipelineStage,
   budget: RunBudget = new RunBudget(),
-  maxModules: number = DEFAULT_MAX_MODULES
+  maxModules: number = DEFAULT_MAX_MODULES,
+  installDeps: boolean = true
 ): Promise<StageResult> {
   const io = stageIo(stageName);
   const definition = await loadAgentDefinition(stageName);
@@ -1139,7 +1153,7 @@ async function runStage(
   if (io.writes.kind === "document") {
     return runDocumentStage(stageName, io, io.writes.path, definition, budget);
   }
-  return runModuleStage(stageName, definition, budget, maxModules);
+  return runModuleStage(stageName, definition, budget, maxModules, installDeps);
 }
 
 /**
@@ -1629,6 +1643,17 @@ interface CliArgs {
    */
   forceIdea: boolean;
   /**
+   * `--no-install` inverted: whether the orchestrator may run
+   * `npm install --ignore-scripts` in the workspace before a module's typecheck.
+   *
+   * On by default, because without it the typecheck cannot see inside any file
+   * that imports a third-party package. Off is a real, supported choice: the
+   * package list is written by a model, and someone who does not want
+   * model-chosen packages fetched onto their machine must be able to decline
+   * without editing code. Declining costs verification coverage, not safety.
+   */
+  installDeps: boolean;
+  /**
    * `--accept-stage <stage>`. The manual escape hatch for a stage that hit a
    * deterministic cap but left a complete artifact behind: record it as
    * successful without re-running it. Like --critic it is a complete
@@ -1638,7 +1663,7 @@ interface CliArgs {
 }
 
 const FLAGS_WITH_VALUES = ["--max-modules", "--max-go-backs", "--critic", ACCEPT_STAGE_FLAG] as const;
-const BOOLEAN_FLAGS = ["--force-idea"] as const;
+const BOOLEAN_FLAGS = ["--force-idea", "--no-install"] as const;
 
 /**
  * Splits `--flags` out of the product idea. Before Phase 4 every argument was
@@ -1651,6 +1676,7 @@ function parseCliArgs(argv: string[]): CliArgs {
   let maxGoBacks = DEFAULT_MAX_GO_BACKS_PER_RUN;
   let critic: string | null = null;
   let forceIdea = false;
+  let installDeps = true;
   let acceptStage: PipelineStage | null = null;
 
   const knownStage = (value: string | undefined): PipelineStage => {
@@ -1689,7 +1715,8 @@ function parseCliArgs(argv: string[]): CliArgs {
       if (value !== undefined) {
         throw new Error(`${name} is a switch and takes no value (got "${value}").`);
       }
-      forceIdea = true;
+      if (name === "--no-install") installDeps = false;
+      else forceIdea = true;
       continue;
     }
 
@@ -1724,6 +1751,7 @@ function parseCliArgs(argv: string[]): CliArgs {
     maxGoBacks,
     critic,
     forceIdea,
+    installDeps,
     acceptStage,
   };
 }
@@ -2041,6 +2069,16 @@ async function main(): Promise<void> {
       `$${MAX_BUDGET_USD_PER_STAGE.toFixed(2)} per call; --max-modules ${cli.maxModules}; ` +
       `--max-go-backs ${cli.maxGoBacks} (used ${goBacksUsed(state0)} so far)`
   );
+  console.log(
+    cli.installDeps
+      ? "Workspace dependencies: the orchestrator will run `npm install --ignore-scripts` in the " +
+          "workspace when package.json's dependency set changes, so the typecheck can resolve " +
+          "imports. Lifecycle scripts are disabled, so no installed package's code ever runs. " +
+          "Pass --no-install to skip it (unresolved imports then stay warnings)."
+      : "Workspace dependencies: --no-install given — nothing will be installed, and unresolved " +
+          "third-party imports stay warnings, so the typecheck cannot see inside files that " +
+          "import them."
+  );
   console.log(`Code workspace: ${workspaceRoot()}`);
   if (state0.stage !== null) {
     console.log(`Resuming: last successful stage was "${state0.stage}", starting at "${firstStage}".`);
@@ -2070,7 +2108,7 @@ async function main(): Promise<void> {
     state = beginStage(state, stage);
     await saveState(state);
 
-    const result = await runStage(stage, budget, cli.maxModules);
+    const result = await runStage(stage, budget, cli.maxModules, cli.installDeps);
 
     if (result.outcome === "success") {
       state = finishStage(state, stage, "success");
