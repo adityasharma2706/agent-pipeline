@@ -122,18 +122,41 @@ then drains the `feedback-router`, then either goes back to an earlier stage and
 re-runs forward from there, or stops. Per-stage and cumulative USD cost are
 logged.
 
-**`--max-modules N`** (default **2**) caps how many modules `spec-implementer`
+**`--max-modules N`** (default **54**) caps how many modules `spec-implementer`
 builds in one invocation:
 
 ```
 npm run orchestrator -- --max-modules 5
 ```
 
-The default is deliberately tiny — the first live run of a loop that writes real
-code should be cheap enough to throw away, and raising it is a decision you make
-on purpose. It is a cap, not a truncation: modules recorded as complete in the
-workspace progress log are skipped, so re-running continues where the last run
-stopped rather than rebuilding.
+It is a cap, not a truncation: modules recorded as complete in the workspace
+progress log are skipped, so re-running continues where the last run stopped
+rather than rebuilding.
+
+The default was **2** through Phase 4, when the first live runs of a loop that
+writes real code had to be cheap enough to throw away. It has done that job.
+A 53-module plan built two at a time is 27 invocations, at which point the cap
+was no longer a safety rail — it was the thing between the pipeline and a
+finished product. **54** is just past the current plan's 53, which hands the
+governor of a normal run to `MAX_BUDGET_USD_PER_RUN` instead. That is the better
+governor: it bounds money rather than a proxy for money, and it halts with
+`partial` — work recorded, nothing lost, re-run to continue — rather than
+truncating.
+
+The run budget was deliberately **not** raised to match. How much to spend per
+invocation is your decision, and a long run stopping every $25 with a clear
+resume message is the intended behaviour. When it happens you get the spend, the
+remaining modules, and the command to continue:
+
+```
+Halted on the cumulative run budget: spent $24.8113 of the $25.00 allowed per run.
+Nothing was lost. Every module that completed is recorded in
+/Users/you/agent-pipeline-workspace/PROGRESS.md and will be skipped, not rebuilt.
+
+To continue where this stopped, run the same command again:
+
+  npm run orchestrator
+```
 
 **`--max-go-backs N`** (default **3**) caps how many times one run may send
 execution back to an earlier stage. **`--critic <target>`** runs a single
@@ -214,7 +237,8 @@ to halt the run. What counts as a retryable failure is a deliberate split:
   message, a stage
   that claims success without writing its output doc, and any module that fails
   one of `spec-implementer`'s four verification checks. A retry re-attempts only
-  the failed module — completed ones are skipped.
+  the failed module — completed ones are skipped — and it is **told what went
+  wrong**; see *Informed retries* below.
 - *Not a failure at all* (`outcome: "partial"`): the module cap or the run
   budget stopped the work. No retry is spent.
 - *Not retryable* (thrown, halts immediately): a missing `STAGE_IO` entry, a
@@ -390,6 +414,70 @@ legitimate comment will fail a module. Both are false positives that cost one
 retry and are recorded with their exact reason, which is the cheaper direction
 to be wrong in.
 
+**Informed retries: a retried module is told what it broke.** Through Phase 5
+this was the single most expensive bug in the pipeline. `buildModulePrompt` took
+no failure parameter, so a module retried after a verification failure received a
+**byte-identical prompt**. The orchestrator knew exactly what was wrong — it had
+the `tsc` diagnostics in its hand — and discarded them, so the agent re-rolled
+blind at full price up to `MAX_RETRIES_PER_STAGE` times. One live run paid $2.29
+to build `M01` and produced this:
+
+```
+apps/web/src/modules/m01_platform/db.ts(131,3): error TS2322: Type 'Promise<void> | undefined' is not assignable to type 'Promise<void>'.
+FAILED — tsc --noEmit reported 1 error(s)
+failed — 50 turns, $2.2903 (cumulative $5.3645); retry 1 of 3
+```
+
+One fixable line, and three more $2.29 attempts queued up that would never be
+told about it. The run was stopped by hand at $5.36.
+
+Now every rejection is classified, recorded, and rendered into the *next*
+attempt's prompt as a clearly-marked leading section (`orchestrator/retry-context.ts`):
+
+- **The real diagnostics, verbatim** — file, line, code, message. **TS2307
+  unresolved-import lines are excluded and must stay excluded.** The workspace
+  has no `node_modules` and the agent has no shell, so every import of anything
+  produces one; forty of them around one real `TS2322` is how the real error gets
+  ignored. `classifyTypecheck` already separates the two buckets, and the retry
+  context reuses that split rather than re-deriving it.
+- **A per-kind remedy.** The five kinds (`typecheck`, `stub`, `req-claim`,
+  `no-files`, `sdk`) are kept apart because the instructions are not
+  interchangeable: "go to line 131 and fix that type error, do not rewrite the
+  module" is nothing like "you wrote placeholder code, implement it for real", and
+  a generic "it failed, try again" is what gets skimmed. `verifyModule` now
+  returns a `failureKind` alongside its reason, so the kind is *known* rather
+  than pattern-matched back out of a prose sentence.
+- **The files the previous attempt left behind**, which are still in the
+  workspace, with an instruction to read and repair them rather than start over.
+  The list is re-checked against disk first: a ledger entry says what *was*
+  written, only `stat` says what is still there. If a human reverted the
+  workspace in between, the section says so instead of sending the agent after
+  files that are gone.
+- **Nothing at all on a first attempt.** With no prior failure the prompt is
+  byte-identical to the Phase 5 one, so the first attempt's cost measurements
+  stay comparable.
+
+The prompt builder moved to `orchestrator/module-prompt.ts` for this. `run.ts`
+imports `query()` at module scope, so any script importing it to inspect a prompt
+has the billable path in its import graph; a prompt is the cheapest thing here to
+get wrong and the most expensive to verify live, so it has to be renderable by a
+script that *cannot* spend money. `module-prompt.ts` and `retry-context.ts` both
+import no SDK.
+
+**The failure context persists in the ledger, across processes.** The alternative
+— holding it in memory for the lifetime of one orchestrator process — was
+considered and rejected. The reason is that the *files* survive a process exit:
+stop a run after `M01` fails, re-run tomorrow, and a per-process design gives
+that "first" attempt an identical prompt and lets it re-roll blind against broken
+files it does not know it wrote. That is the original bug with extra steps. So
+each failed ledger entry carries a structured `failure` record (ledger schema
+**v3**; the bump is additive, v2 entries load unchanged), and the first attempt of
+a new process is fed it and told plainly that the previous attempt ran in a
+session it has no memory of. A v2 entry with no structured record is not wasted
+either: its prose `failureReason` is parsed back into the best available record,
+confined to one clearly-marked legacy function, because there is already one such
+ledger in the wild — the halted `M01` run above.
+
 **The progress log** lives in the workspace (`pipeline-progress.json` plus a
 generated `PROGRESS.md`), *not* in `docs/`. `docs/` is pipeline-owned — every
 file in it is a stage artifact with a declared writer and reader; the progress
@@ -400,6 +488,21 @@ failure — exactly why the orchestrator rejected it. Failures are appended just
 like successes: a module that failed honestly and said why is more useful than
 one that quietly stubbed. It is also the resume ledger, which is what makes
 `--max-modules` a resumable cap rather than a truncation.
+
+**Only `"success"` counts as complete.** A failed module leaves its files in the
+workspace *and* a `"failure"` entry in the ledger, and `completedModuleIds`
+filters on the outcome — so a later run re-attempts it rather than mistaking that
+partial output for a finished module. The same entry is what the re-attempt's
+prompt is built from, which is the point: the files and the reason they were
+rejected stay together, and the agent repairing them is told they are its own
+prior output.
+
+Resume is driven by `state.stage` (the last stage that *succeeded*) plus the
+ledger, and never by the history log. So the `"in-progress"` entries a killed
+process leaves behind cannot confuse it: they are an honest record that something
+was started and never finished, `finishStage` closes only the entry the current
+run opened, and only `outcome: "success"` moves `state.stage` — `"failure"` and
+`"partial"` both leave it where it was.
 
 **Workspace identity: a ledger belongs to one plan.** Module ids are
 *positional* — every product's `docs/implementer.md` starts at `M01` — so an
@@ -669,6 +772,16 @@ agent-pipeline/
                    workspace.ts workspace bootstrap, snapshots, typecheck
                    verify.ts    per-module verification + stub detection
                    progress.ts  the workspace progress log / resume ledger
+                   module-prompt.ts
+                                the per-module spec-implementer prompt.
+                                NO SDK import, so a prompt change can be
+                                rendered and read without a billable call.
+                   retry-context.ts
+                                what a retried module is told about its own
+                                previous attempt: failure kinds, the filtered
+                                diagnostics, the per-kind remedy. Also no SDK
+                                import, and no import of progress.ts/verify.ts
+                                (both depend on it).
                    router.ts    the router contract: output schema, runtime
                                 validation, the confidence gate, planDrain.
                                 PURE — no SDK import, so the gate can be

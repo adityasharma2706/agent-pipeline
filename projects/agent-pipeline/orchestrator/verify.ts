@@ -6,6 +6,7 @@
 // (files written, typecheck, stub density, REQ scope), all run by this process.
 
 import type { ModuleSpec } from "./modules.js";
+import type { ModuleFailureKind } from "./retry-context.js";
 import { readWorkspaceFile } from "./workspace.js";
 import type { TypecheckResult } from "./workspace.js";
 
@@ -227,6 +228,18 @@ export interface ModuleVerification {
   ok: boolean;
   /** Human-readable reason for failure; null when ok. */
   failureReason: string | null;
+  /**
+   * WHICH check rejected the module; null when ok.
+   *
+   * Set alongside `failureReason` rather than sniffed back out of it later. The
+   * retry prompt's remedy text branches on this (telling an agent that wrote
+   * placeholder code to "go to line 131 and fix the type error" is worse than
+   * telling it nothing), and recovering the kind by pattern-matching a prose
+   * sentence would be a new way to be wrong about it.
+   */
+  failureKind: ModuleFailureKind | null;
+  /** REQ ids claimed but not owned. Empty unless failureKind is "req-claim". */
+  unownedReqs: string[];
   /** Non-fatal observations worth recording (missing deps, absent report). */
   warnings: string[];
   filesWritten: string[];
@@ -267,6 +280,7 @@ export async function verifyModule(
     filesWritten,
     reqsClaimed: reported.reqs,
     typecheck,
+    unownedReqs: [] as string[],
   };
 
   // 1. Did anything actually get written?
@@ -274,6 +288,7 @@ export async function verifyModule(
     return {
       ...base,
       ok: false,
+      failureKind: "no-files",
       failureReason: "no files were created or modified in the workspace during this call",
       stub: empty,
     };
@@ -285,6 +300,8 @@ export async function verifyModule(
     return {
       ...base,
       ok: false,
+      failureKind: "req-claim",
+      unownedReqs: unowned,
       stub: empty,
       failureReason:
         `claimed REQ IDs it does not own: ${unowned.join(", ")} ` +
@@ -295,7 +312,13 @@ export async function verifyModule(
   // 3. Is what it wrote substantially placeholder?
   const stub = await detectStubs(filesWritten);
   if (stub.isStub) {
-    return { ...base, ok: false, stub, failureReason: `stub detection tripped — ${stub.reason}` };
+    return {
+      ...base,
+      ok: false,
+      failureKind: "stub",
+      stub,
+      failureReason: `stub detection tripped — ${stub.reason}`,
+    };
   }
 
   // 4. Does the whole workspace still typecheck?
@@ -306,9 +329,10 @@ export async function verifyModule(
       ...base,
       stub,
       ok: false,
+      failureKind: "typecheck",
       failureReason: `tsc --noEmit reported ${typecheck.errors.length} error(s):\n      ${shown}${more}`,
     };
   }
 
-  return { ...base, ok: true, failureReason: null, stub };
+  return { ...base, ok: true, failureKind: null, failureReason: null, stub };
 }

@@ -286,6 +286,27 @@ export async function typecheckWorkspace(): Promise<TypecheckResult> {
   }
 }
 
+/**
+ * Filters a list of workspace-relative paths down to the ones that still exist.
+ *
+ * Used before telling a retried module to "read and repair the files your last
+ * attempt wrote": if a human reverted or deleted that output between runs, the
+ * instruction is a lie and sends the agent looking for files that are not there.
+ * `stat` rather than a read, because the contents are the agent's job, not ours.
+ */
+export async function existingWorkspaceFiles(relPaths: readonly string[]): Promise<string[]> {
+  const present: string[] = [];
+  for (const relPath of relPaths) {
+    try {
+      await stat(path.join(workspaceRoot(), relPath));
+      present.push(relPath);
+    } catch {
+      // Absent or unreadable: either way it cannot be read and repaired.
+    }
+  }
+  return present;
+}
+
 /** Reads a workspace file, returning null when it is unreadable. */
 export async function readWorkspaceFile(relPath: string): Promise<string | null> {
   try {

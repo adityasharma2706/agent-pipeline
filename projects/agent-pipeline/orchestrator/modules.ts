@@ -25,7 +25,12 @@ export interface ModuleSpec {
 }
 
 /** `### M07 Stage Registry & Mode Profiles` */
-const MODULE_HEADING_RE = /^###\s+(M\d+)\s*(.*)$/;
+// The separator between id and title varies with whoever wrote the plan:
+// "### M01 Config & Policy" and "### M01: Platform foundation" are both real
+// output from implementation-planning. Without the optional colon/dash the
+// title parses as ": Platform foundation" and the agent is told to build
+// `M01 (: Platform foundation)`.
+const MODULE_HEADING_RE = /^###\s+(M\d+)\s*[:—–-]?\s*(.*)$/;
 
 /** Any other markdown heading ends the current module's body. */
 const ANY_HEADING_RE = /^#{1,6}\s/;

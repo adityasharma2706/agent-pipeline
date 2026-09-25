@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { ModuleFailureRecord } from "./retry-context.js";
 import { PROGRESS_JSON, PROGRESS_MD, workspaceRoot } from "./workspace.js";
 
 export interface ModuleProgressEntry {
@@ -26,6 +27,21 @@ export interface ModuleProgressEntry {
   reqsClaimed: string[];
   /** Populated on failure: why the orchestrator rejected the module. */
   failureReason: string | null;
+  /**
+   * Populated on failure: the STRUCTURED form of the same rejection, which is
+   * what the next attempt's prompt is built from (orchestrator/retry-context.ts).
+   *
+   * It lives in the ledger rather than in orchestrator memory because the
+   * failing files live in the workspace, and the two have to survive together.
+   * A run stopped after a failure and re-run later would otherwise give its
+   * "first" attempt an identical prompt and re-roll blind against files it does
+   * not know it wrote — exactly the bug the in-process feedback fixes.
+   *
+   * Optional: absent on every success, and absent on failures recorded by a
+   * build before the field existed (v2 ledgers), which readers degrade
+   * gracefully for rather than rejecting.
+   */
+  failure?: ModuleFailureRecord;
   /** Deviation notes the agent reported, verbatim. */
   deviations: string | null;
   /** Non-fatal observations (unresolved imports, missing self-report). */
@@ -52,8 +68,14 @@ export interface LedgerIdentity {
 }
 
 export interface ProgressLog {
-  /** Schema marker so a later phase can migrate this file knowingly. */
-  version: 2;
+  /**
+   * Schema marker so a later phase can migrate this file knowingly.
+   *
+   * 3 added `entries[].failure`. The bump is additive — v2 entries load
+   * unchanged and simply carry no structured failure — so no migration is
+   * needed and none is performed.
+   */
+  version: 3;
   updatedAt: string;
   /**
    * Provenance of `entries`. Null only for a ledger written before the field
@@ -85,12 +107,45 @@ export function hashDocument(text: string | null): string | null {
 
 function emptyLog(identity: LedgerIdentity | null): ProgressLog {
   return {
-    version: 2,
+    version: 3,
     updatedAt: new Date().toISOString(),
     planHash: identity?.planHash ?? null,
     ideaHash: identity?.ideaHash ?? null,
     entries: [],
   };
+}
+
+const FAILURE_KINDS: ReadonlySet<string> = new Set([
+  "no-files",
+  "req-claim",
+  "stub",
+  "typecheck",
+  "sdk",
+]);
+
+/** Every string array in a ModuleFailureRecord, checked the same way. */
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/**
+ * Validates `entries[].failure` when it is present.
+ *
+ * A malformed record is REJECTED rather than repaired: it is fed verbatim into a
+ * prompt that costs real money, and half-parsed diagnostics would send the next
+ * attempt after an error that was never reported.
+ */
+function isFailureRecord(value: unknown): value is ModuleFailureRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.kind === "string" &&
+    FAILURE_KINDS.has(record.kind) &&
+    typeof record.reason === "string" &&
+    isStringArray(record.typecheckErrors) &&
+    isStringArray(record.stubFindings) &&
+    isStringArray(record.unownedReqs)
+  );
 }
 
 function isEntry(value: unknown): value is ModuleProgressEntry {
@@ -99,7 +154,8 @@ function isEntry(value: unknown): value is ModuleProgressEntry {
   return (
     typeof entry.moduleId === "string" &&
     (entry.outcome === "success" || entry.outcome === "failure") &&
-    Array.isArray(entry.filesWritten)
+    Array.isArray(entry.filesWritten) &&
+    (entry.failure === undefined || isFailureRecord(entry.failure))
   );
 }
 
@@ -132,7 +188,7 @@ export async function loadProgress(): Promise<ProgressLog> {
     throw new Error(`${file} does not match the expected progress-log shape. Fix or delete it.`);
   }
   return {
-    version: 2,
+    version: 3,
     updatedAt: new Date().toISOString(),
     planHash: typeof candidate.planHash === "string" ? candidate.planHash : null,
     ideaHash: typeof candidate.ideaHash === "string" ? candidate.ideaHash : null,
@@ -223,6 +279,9 @@ function renderMarkdown(log: ProgressLog): string {
     );
     lines.push(`- REQs claimed: ${entry.reqsClaimed.length > 0 ? entry.reqsClaimed.join(", ") : "(none)"}`);
     if (entry.failureReason !== null) lines.push(`- Failed because: ${entry.failureReason}`);
+    if (entry.failure !== undefined) {
+      lines.push(`- Failure kind: ${entry.failure.kind} (fed back into the next attempt's prompt)`);
+    }
     if (entry.deviations !== null) lines.push(`- Deviations reported: ${entry.deviations}`);
     for (const warning of entry.warnings) lines.push(`- Warning: ${warning}`);
     lines.push("");
@@ -241,7 +300,7 @@ export async function appendProgress(
   entry: ModuleProgressEntry
 ): Promise<ProgressLog> {
   const next: ProgressLog = {
-    version: 2,
+    version: 3,
     updatedAt: new Date().toISOString(),
     planHash: log.planHash,
     ideaHash: log.ideaHash,

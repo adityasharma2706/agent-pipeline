@@ -1,5 +1,5 @@
 {
-  "stage": "system-design",
+  "stage": "low-level-design",
   "history": [
     {
       "stage": "product-understanding",
@@ -73,7 +73,39 @@
       "startedAt": "2026-09-25T01:24:33.794Z",
       "finishedAt": null,
       "outcome": "in-progress"
+    },
+    {
+      "stage": "low-level-design",
+      "startedAt": "2026-09-25T01:25:04.245Z",
+      "finishedAt": null,
+      "outcome": "in-progress"
+    },
+    {
+      "stage": "low-level-design",
+      "startedAt": "2026-09-25T01:25:26.081Z",
+      "finishedAt": null,
+      "outcome": "in-progress"
+    },
+    {
+      "stage": "low-level-design",
+      "startedAt": "2026-09-25T01:29:01.532Z",
+      "finishedAt": "2026-09-25T01:45:51.981Z",
+      "outcome": "success"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-25T01:45:51.982Z",
+      "finishedAt": "2026-09-25T01:55:04.531Z",
+      "outcome": "failure"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-25T01:55:04.532Z",
+      "finishedAt": null,
+      "outcome": "in-progress"
     }
   ],
-  "retries": {}
+  "retries": {
+    "spec-implementer": 1
+  }
 }

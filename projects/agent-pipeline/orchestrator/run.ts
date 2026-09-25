@@ -76,10 +76,10 @@ import {
 import { appendRoutingEntry, loadRoutingLog, nextRoutingDecisionId, routingLogPath } from "./routing.js";
 import { MAX_BUDGET_USD_PER_RUN, RunBudget } from "./budget.js";
 import { loadModules } from "./modules.js";
-import type { ModuleSpec } from "./modules.js";
 import {
   changedFiles,
   ensureWorkspace,
+  existingWorkspaceFiles,
   snapshotWorkspace,
   typecheckWorkspace,
   workspaceRoot,
@@ -93,6 +93,9 @@ import {
 } from "./progress.js";
 import type { LedgerIdentity, ProgressLog } from "./progress.js";
 import { parseReportedProgress, verifyModule } from "./verify.js";
+import { latestFailedAttempt } from "./retry-context.js";
+import type { ModuleFailureRecord, PriorAttempt } from "./retry-context.js";
+import { DOCS_DIR, IMPLEMENTER_DOC, buildModulePrompt } from "./module-prompt.js";
 import {
   DeterministicStageFailure,
   buildDeterministicHaltMessage,
@@ -144,13 +147,39 @@ const MAX_BUDGET_USD_PER_STAGE = 8.0;
 const MIN_BUDGET_HEADROOM_USD = 0.5;
 
 /**
- * How many modules one invocation may build. Deliberately tiny: the first live
- * run of a loop that writes real code should be cheap enough to throw away, and
- * raising it is a decision the human makes with `--max-modules N`. Modules
- * already recorded complete in the workspace progress log are skipped, so a
- * second run continues rather than redoing.
+ * How many modules one invocation may build.
+ *
+ * This was 2 through Phase 4: the first live runs of a loop that writes real
+ * code had to be cheap enough to throw away, and a tiny cap was the crudest
+ * reliable way to guarantee that. It has done that job. A 53-module plan built
+ * two at a time is 27 invocations, and the cap stopped being a safety rail and
+ * became the thing standing between the pipeline and a finished product.
+ *
+ * 54 is deliberately just past the current plan's 53, so the module cap is no
+ * longer the governor of a normal run: MAX_BUDGET_USD_PER_RUN is. That is the
+ * better governor, because it bounds the thing that actually matters (money)
+ * rather than a proxy for it, and because it halts with `partial` — real work
+ * recorded, nothing lost, re-run to continue — instead of truncating.
+ *
+ * The run budget is NOT raised to match. How much to spend is the human's
+ * decision, and a long run stopping every $25 with a clear resume message is
+ * the intended behaviour, not a limitation to engineer around.
+ *
+ * Modules already recorded complete in the workspace progress log are skipped,
+ * so a second run continues rather than redoing. `--max-modules N` still
+ * overrides this for anyone who wants the old small-bite behaviour.
  */
-const DEFAULT_MAX_MODULES = 2;
+const DEFAULT_MAX_MODULES = 54;
+
+/**
+ * When this process started, as the ISO string the ledger's timestamps use.
+ *
+ * Read once so that "did this failure happen in THIS process or an earlier one"
+ * has a single stable answer for the whole run (see latestFailedAttempt). The
+ * distinction is not cosmetic: a retried module is told whether the files it is
+ * repairing came from a session it remembers or one it does not.
+ */
+const PROCESS_STARTED_AT = new Date().toISOString();
 
 /** The phase this build implements, used only for console/error wording. */
 const CURRENT_PHASE = 5;
@@ -184,12 +213,6 @@ const GO_BACK_DOC_STAGE_ESTIMATE_USD = 1.0;
 
 /** Where the raw product idea is persisted so re-runs and agents can see it. */
 const IDEA_DOC = "docs/idea.md";
-
-/** The module breakdown spec-implementer loops over. */
-const IMPLEMENTER_DOC = "docs/implementer.md";
-
-/** Absolute path to the pipeline's docs, granted to the workspace stage read-only. */
-const DOCS_DIR = path.join(PROJECT_ROOT, "docs");
 
 /**
  * What a stage produces.
@@ -517,43 +540,6 @@ function buildDocumentPrompt(stage: PipelineStage, io: StageIo, outputPath: stri
   ].join("\n\n");
 }
 
-/**
- * The per-module instruction for spec-implementer.
- *
- * Note what it does NOT do: paste docs/lld.md. That file is well over a
- * thousand lines, and re-sending all of it on every one of N module calls is
- * the single most expensive mistake available here. The agent has Grep and is
- * told to find its own section.
- */
-function buildModulePrompt(
-  spec: ModuleSpec,
-  position: number,
-  total: number,
-  completed: string[]
-): string {
-  const done =
-    completed.length > 0
-      ? `Modules already built in this workspace: ${completed.join(", ")}. Their files exist ` +
-        `already — import from them, and do not rewrite them.`
-      : `This is the first module built in this workspace; it is otherwise empty apart from ` +
-        `package.json, tsconfig.json and the progress log.`;
-
-  return [
-    `You are running as the "spec-implementer" stage of an automated product-development pipeline.`,
-    `Build exactly ONE module this call: ${spec.id} (${spec.title}). It is module ${position} of ${total} in the build order.`,
-    `The pipeline's design documents are at ${DOCS_DIR} and are READ-ONLY — never write there.`,
-    `Do NOT read docs/lld.md end to end. Use Grep on ${path.join(DOCS_DIR, "lld.md")} to find the "${spec.id}" section, then read only that section and whatever it explicitly references.`,
-    `Your working directory is ${workspaceRoot()}. All code you write goes there, at paths of your own choosing consistent with the design.`,
-    done,
-    `Here is ${spec.id}'s entry from ${IMPLEMENTER_DOC}, verbatim:\n\n${spec.body}`,
-    spec.reqs.length > 0
-      ? `The requirement IDs assigned to ${spec.id} are: ${spec.reqs.join(", ")}. Claim these and only these; claiming a REQ ID this module does not own fails the stage.`
-      : `${IMPLEMENTER_DOC} assigns no REQ IDs to ${spec.id}, so report "none" for reqs.`,
-    `You have no shell. Write real, complete code — the orchestrator runs tsc against the workspace after this call and rejects placeholder output.`,
-    `Finish with the PIPELINE-PROGRESS block described in your instructions.`,
-  ].join("\n\n");
-}
-
 interface QueryOutcome {
   ok: boolean;
   text: string;
@@ -778,6 +764,31 @@ async function currentLedgerIdentity(): Promise<LedgerIdentity> {
  * modules import earlier ones, so continuing past a broken module buys a
  * cascade of failures at full price.
  */
+/**
+ * What the previous failed attempt at `moduleId` left behind, or null if there
+ * was no previous failed attempt.
+ *
+ * The ledger is the source of truth rather than an in-memory map, because the
+ * two situations that need this are (a) a stage retry inside one process and
+ * (b) a re-run in a NEW process after the run was stopped — and only the ledger
+ * spans both. See ModuleProgressEntry.failure for why that is the right call.
+ *
+ * The recorded file list is re-checked against disk before it is promised to
+ * the agent. A ledger entry says what WAS written; only `stat` says what is
+ * still there.
+ */
+async function priorAttemptFor(progress: ProgressLog, moduleId: string): Promise<PriorAttempt | null> {
+  const prior = latestFailedAttempt(progress.entries, moduleId, PROCESS_STARTED_AT);
+  if (prior === null) return null;
+
+  const present = await existingWorkspaceFiles(prior.filesWritten);
+  return {
+    ...prior,
+    filesWritten: present,
+    filesVanished: prior.filesWritten.length > 0 && present.length === 0,
+  };
+}
+
 async function runModuleStage(
   stageName: PipelineStage,
   definition: AgentDefinition,
@@ -846,6 +857,19 @@ async function runModuleStage(
     const position = modules.findIndex((m) => m.id === spec.id) + 1;
     console.log(`  --> ${spec.id} ${spec.title} (module ${position} of ${modules.length})`);
 
+    // Everything the previous failed attempt at THIS module knew, recovered
+    // from the ledger rather than from memory. That is what makes it work
+    // identically for an in-process retry (the stage retry loop re-enters this
+    // function from the top) and for a fresh process resuming after a halt.
+    const prior = await priorAttemptFor(progress, spec.id);
+    if (prior !== null) {
+      console.log(
+        `      retry: attempt ${prior.attemptNumber + 1}, informed by the ${prior.record.kind} ` +
+          `failure recorded ${prior.crossProcess ? "by an earlier process" : "earlier in this run"} ` +
+          `(${prior.filesWritten.length} file(s) of its output still present)`
+      );
+    }
+
     const startedAt = new Date().toISOString();
     const before = await snapshotWorkspace();
 
@@ -854,7 +878,7 @@ async function runModuleStage(
       `${stageName}/${spec.id}`,
       definition,
       stageName,
-      buildModulePrompt(spec, position, modules.length, [...completed]),
+      buildModulePrompt(spec, position, modules.length, [...completed], prior),
       {
         cwd: workspaceRoot(),
         maxBudgetUsd: allowanceUsd,
@@ -881,6 +905,27 @@ async function runModuleStage(
     const failureReason = sdkFailure ?? verification.failureReason;
     const moduleOk = failureReason === null;
 
+    // Structured, so the NEXT attempt can be told what to repair. Built here
+    // rather than in the verifier because the SDK-level failure is only known
+    // at this level, and it has to be one of the kinds too — a call that died
+    // mid-write still left files behind that the next attempt must not
+    // duplicate.
+    const failureRecord: ModuleFailureRecord | undefined = moduleOk
+      ? undefined
+      : {
+          kind: sdkFailure !== null ? "sdk" : (verification.failureKind ?? "sdk"),
+          reason: failureReason,
+          // TS2307 lines are in typecheck.missingModuleWarnings, never in
+          // .errors, so this is already the filtered set. Do not "helpfully"
+          // add the warnings back: forty unresolved-import lines around one
+          // real TS2322 is how the real error gets ignored.
+          typecheckErrors: [...typecheck.errors],
+          stubFindings: verification.stub.findings.map(
+            (finding) => `${finding.file}:${finding.line} — ${finding.label}: ${finding.text}`
+          ),
+          unownedReqs: [...verification.unownedReqs],
+        };
+
     progress = await appendProgress(progress, {
       moduleId: spec.id,
       title: spec.title,
@@ -890,6 +935,7 @@ async function runModuleStage(
       filesWritten: written,
       reqsClaimed: verification.reqsClaimed,
       failureReason,
+      ...(failureRecord === undefined ? {} : { failure: failureRecord }),
       deviations: reported.deviations,
       warnings: verification.warnings,
       costUsd: outcome.costUsd,
@@ -1955,11 +2001,31 @@ async function main(): Promise<void> {
         console.log(`    ${line}`);
       }
       console.log("");
-      console.log(
-        result.budgetHalt
-          ? `Halted on the cumulative run budget. Raise MAX_BUDGET_USD_PER_RUN or re-run to continue.`
-          : `Re-run to continue "${stage}" — completed work is skipped, not redone.`
-      );
+      if (result.budgetHalt) {
+        // With --max-modules defaulting to 54, THIS is the message that ends a
+        // normal long run, so it has to answer both questions a human has at
+        // that moment: how much did that cost, and what do I type next.
+        console.log(
+          `Halted on the cumulative run budget: spent $${budget.spent.toFixed(4)} of the ` +
+            `$${budget.cap.toFixed(2)} allowed per run.`
+        );
+        console.log(
+          `Nothing was lost. Every module that completed is recorded in ` +
+            `${workspaceRoot()}/PROGRESS.md and will be skipped, not rebuilt.`
+        );
+        console.log("");
+        console.log(`To continue where this stopped, run the same command again:`);
+        console.log("");
+        console.log(`  npm run orchestrator`);
+        console.log("");
+        console.log(
+          `Each invocation gets a fresh $${budget.cap.toFixed(2)} budget, so a long plan finishes ` +
+            `over several runs. Raising MAX_BUDGET_USD_PER_RUN in orchestrator/budget.ts would mean ` +
+            `fewer, larger runs — that is a spending decision and is deliberately left to you.`
+        );
+      } else {
+        console.log(`Re-run to continue "${stage}" — completed work is skipped, not redone.`);
+      }
       break;
     }
 
