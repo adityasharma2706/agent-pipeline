@@ -97,6 +97,14 @@ import {
 import type { LedgerIdentity, ProgressLog } from "./progress.js";
 import { parseReportedProgress, verifyModule } from "./verify.js";
 import {
+  baselineFrom,
+  carryForwardBaseline,
+  describeInheritedOwners,
+  fileOwners,
+  summariseInherited,
+} from "./baseline.js";
+import type { DiagnosticBaseline, InheritedDiagnostic } from "./baseline.js";
+import {
   MAX_ATTEMPTS_PER_MODULE,
   failedAttemptCount,
   latestFailedAttempt,
@@ -157,6 +165,13 @@ const MAX_BUDGET_USD_PER_STAGE = 8.0;
  * partway through: money spent, nothing produced. Below this, halt cleanly.
  */
 const MIN_BUDGET_HEADROOM_USD = 0.5;
+
+/**
+ * How many inherited (pre-existing, not-this-module's-fault) typecheck errors
+ * to print per attempt before truncating. Every one of them is written to the
+ * ledger regardless; this only bounds the console.
+ */
+const MAX_INHERITED_LOG_LINES = 5;
 
 /**
  * How many modules one invocation may build.
@@ -904,6 +919,40 @@ async function moduleExhaustedHalt(
   return new ModuleAttemptsExhausted(message, spec.id);
 }
 
+/**
+ * The end-of-stage accounting for errors nobody was failed for.
+ *
+ * Not failing a module for code it did not write is right. Leaving the code
+ * broken and unmentioned is not: an error that fails nobody and is reported to
+ * nobody never gets fixed. So the ones still outstanding are counted out loud,
+ * with the module that owns each file, because somebody has to decide to fix
+ * them and the pipeline's job here is to make that decision visible rather than
+ * to hide it or to bill it to the wrong module.
+ */
+function reportInheritedAtStageEnd(inherited: readonly InheritedDiagnostic[]): void {
+  if (inherited.length === 0) {
+    console.log("  inherited typecheck errors outstanding at end of stage: none");
+    return;
+  }
+
+  const byOwner = summariseInherited(inherited);
+  const files = new Set(inherited.map((item) => item.file)).size;
+  console.log(
+    `  inherited typecheck errors outstanding at end of stage: ${inherited.length} across ` +
+      `${files} file(s), owned by ${byOwner.length} module(s)`
+  );
+  for (const owner of byOwner) {
+    console.log(
+      `    ${owner.owner ?? "(unattributed — no ledger entry claims these files)"}: ` +
+        `${owner.diagnostics} error(s) in ${owner.files.length} file(s) — ${owner.files.join(", ")}`
+    );
+  }
+  console.log(
+    `    these failed no module and are recorded per attempt in ${PROGRESS_JSON} ` +
+      `(entries[].inheritedDiagnostics); the reviewer stage can act on them`
+  );
+}
+
 async function runModuleStage(
   stageName: PipelineStage,
   definition: AgentDefinition,
@@ -955,6 +1004,22 @@ async function runModuleStage(
 
   const notes: string[] = [];
   let built = 0;
+
+  // THE TYPECHECK BASELINE — see orchestrator/baseline.ts for the incident.
+  //
+  // Captured ONCE here, then carried forward: the post-verification typecheck
+  // of module N is the pre-call state of module N+1, so the whole stage pays
+  // for exactly one extra `tsc` run rather than doubling them. It is taken
+  // AFTER the "nothing pending" early return, so a fully-built workspace pays
+  // for nothing at all.
+  let baseline: DiagnosticBaseline = baselineFrom(await typecheckWorkspace(), "stage start");
+  console.log(
+    `  typecheck baseline: ${baseline.size} pre-existing diagnostic(s) in the workspace at stage ` +
+      `start; no module will be failed for these unless it touches their file`
+  );
+  // The inherited set as of the most recent attempt — i.e. what is still
+  // outstanding — for the end-of-stage summary.
+  let outstandingInherited: InheritedDiagnostic[] = [];
 
   // Labelled because the inner per-attempt loop needs to be able to stop the
   // whole STAGE: the --max-modules cap and the run budget end the stage, while a
@@ -1064,7 +1129,54 @@ async function runModuleStage(
       // error" and "the code it already wrote is broken" are different facts, and
       // the second one is the one that has to be recorded.
       const typecheck = await typecheckWorkspace();
-      const verification = await verifyModule(spec, written, reported, typecheck, deps);
+      // `deps.status === "installed"` is the trap, named explicitly: an install
+      // that ACTUALLY RAN this attempt has just made files visible to tsc that
+      // were hidden behind TS2307 a moment ago, and every error inside them
+      // would otherwise land on this module. "unchanged" and "disabled" changed
+      // nothing on disk and get no such allowance.
+      const installRan = deps.status === "installed";
+      if (installRan) {
+        console.log(
+          `      baseline: a dependency install ran during this attempt, so errors newly visible ` +
+            `in the ${baseline.importBlockedFiles.size} file(s) whose imports were previously ` +
+            `unresolved are treated as pre-existing, not as ${spec.id}'s`
+        );
+      }
+      const verification = await verifyModule(spec, written, reported, typecheck, deps, {
+        baseline,
+        installRan,
+        // Built from the ledger written so far: filesWritten is what makes
+        // "who owns this file" answerable at all.
+        owners: fileOwners(progress.entries),
+      });
+
+      // Carried forward whether the module passed or failed, and BEFORE the
+      // `continue` that starts the next attempt.
+      baseline = carryForwardBaseline(
+        typecheck,
+        verification.typecheckErrors,
+        `after ${spec.id} attempt ${attemptsUsed + 1}`
+      );
+      outstandingInherited = verification.inherited;
+
+      if (verification.inherited.length > 0) {
+        console.log(
+          `      inherited: ${verification.inherited.length} pre-existing typecheck error(s) in ` +
+            `files ${spec.id} did not write — NOT its fault and not counted against it ` +
+            `(owners: ${describeInheritedOwners(verification.inherited)})`
+        );
+        for (const item of verification.inherited.slice(0, MAX_INHERITED_LOG_LINES)) {
+          console.log(
+            `        [${item.reason}, owner ${item.owner ?? "unattributed"}] ${item.diagnostic}`
+          );
+        }
+        if (verification.inherited.length > MAX_INHERITED_LOG_LINES) {
+          console.log(
+            `        ...and ${verification.inherited.length - MAX_INHERITED_LOG_LINES} more ` +
+              `(all of them recorded in ${PROGRESS_JSON})`
+          );
+        }
+      }
 
       const sdkFailure = outcome.ok ? null : `the SDK call did not succeed: ${outcome.text.slice(0, 300)}`;
       const failureReason = sdkFailure ?? verification.failureReason;
@@ -1104,6 +1216,9 @@ async function runModuleStage(
         reqsClaimed: verification.reqsClaimed,
         failureReason,
         ...(failureRecord === undefined ? {} : { failure: failureRecord }),
+        ...(verification.inherited.length === 0
+          ? {}
+          : { inheritedDiagnostics: verification.inherited }),
         deviations: reported.deviations,
         warnings: verification.warnings,
         costUsd: outcome.costUsd,
@@ -1167,6 +1282,8 @@ async function runModuleStage(
       );
     }
   }
+
+  reportInheritedAtStageEnd(outstandingInherited);
 
   const remaining = modules.filter((module) => !completed.has(module.id));
   if (remaining.length === 0) {

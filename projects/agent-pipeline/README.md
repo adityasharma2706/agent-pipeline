@@ -580,9 +580,12 @@ stopping at the first failure:
    any ID `docs/implementer.md` does not assign to that module fails the stage.
    A module inventing requirement IDs is a red flag, not a rounding error.
 3. **Not a stub** — see below.
-4. **`tsc --noEmit` is clean.** The orchestrator runs TypeScript against the
-   whole workspace and requires exit 0. Every diagnostic code fails the module,
-   with one state-dependent exception — `TS2307: Cannot find module`:
+4. **`tsc --noEmit` is clean *of this module's own errors*.** The orchestrator
+   runs TypeScript against the whole workspace, and charges the module only the
+   diagnostics that are actually its own — see *Whose typecheck error is this?*
+   below, which is the difference between failing a module and failing whoever
+   happened to be building. Among the diagnostics it does own, every code fails
+   it, with one state-dependent exception — `TS2307: Cannot find module`:
 
    - **If a dependency install has *not* succeeded** for the currently declared
      set (`--no-install`, the install failed, or `package.json` declares
@@ -601,6 +604,99 @@ stopping at the first failure:
    `dependenciesResolved` flag returned by `deps.ts` — and never re-derived
    elsewhere. Getting it backwards either fails every module or makes the
    typecheck verifier useless.
+
+**Whose typecheck error is this? Baselining pre-existing diagnostics**
+(`orchestrator/baseline.ts`).
+
+`tsc` is run over the **whole workspace**, and the verifier used to fail the
+module that happened to be building on every diagnostic it printed. That is an
+attribution bug, and it cost real money. On a 53-module live run, **M06**
+("Consent and privacy notice ledger") failed all three attempts, at **$2.78**,
+on seven errors — five in `apps/web/src/modules/m04_ui/*` and
+`apps/web/src/app/[locale]/*`, written by **M04**, and one in
+`apps/web/src/modules/m01_platform/redis.ts`, written by **M01**. M06 wrote nine
+files, all under `apps/web/src/modules/m06_consent/`, plus a migration. Not one
+error was in a file it wrote. The agent could not have fixed them: it was told to
+build M06, it built M06, and it was failed for someone else's code.
+
+How those errors got there is the part worth keeping in mind. M01 and M04 passed
+verification *before dependency installs existed*. With no `ioredis`, `react`,
+`next` or `next-intl` on disk, every file importing them stopped at `TS2307` and
+tsc could not see the rest of it. Adding installs later resolved those imports,
+exposing genuine bugs that had been hidden all along — and they surfaced on
+whichever module was running at the time.
+
+So the workspace's current diagnostics are captured as a **baseline** before a
+module's `query()` call, and afterwards the module is answerable for exactly two
+things:
+
+- diagnostics that are **new** relative to that baseline, and
+- diagnostics in **files it wrote or modified** during the attempt — it touched
+  the file, so it owns what it did to it. This is what still catches "module X
+  edits a shared file and breaks it", including the case where X breaks a *call
+  site* it never opened: that error is new, the call site was checkable before,
+  and it stays X's.
+
+Everything else is **inherited**: pre-existing, somebody else's, and it does not
+fail the module.
+
+- **The identity of a diagnostic is `(file, error code, message)` — no line
+  number.** The baseline is compared across an edit, and edits move lines.
+  Including the line would make ten inserted lines at the top of a shared file
+  turn every pre-existing error below into a "new" one, landing on the current
+  module — a smaller version of the bug this exists to fix. The message text
+  already carries the type names that distinguish one error from another.
+  Identical code *and* message *and* file are told apart by **counting** rather
+  than by set membership: the baseline stores occurrences, and a module owns the
+  excess, so adding a second copy of an existing error still fails it.
+- **One extra `tsc` per stage, not per module.** The baseline is computed once at
+  stage start, then *carried forward*: the post-verification typecheck of module
+  N is the pre-call state of module N+1. What is carried forward is that run's
+  diagnostics **minus the ones just charged to the module**. Subtracting is not a
+  detail — without it, a module that failed on its own type errors would find
+  them in the baseline on its retry, be told they are somebody else's, and pass
+  without fixing anything.
+- **A dependency install mid-stage invalidates the baseline, and is handled
+  explicitly.** This is the specific trap that caused the incident: an install
+  makes files visible to `tsc` that were hidden behind `TS2307` a moment ago, so
+  the baseline taken before it genuinely does not contain those lines. The
+  baseline therefore also records **which files were import-blocked when it was
+  taken**; when `deps.status === "installed"` — an install that *actually ran*
+  this attempt, not `"unchanged"` or `"disabled"` — new diagnostics in those
+  files, in files the module did not touch, are attributed as
+  `revealed-by-install` rather than to the module. The allowance is scoped as
+  tightly as it can be: only after a real install, only in untouched files, only
+  in files whose imports were previously unresolved. It costs no third `tsc`
+  run, because the post-install typecheck *is* the verification run.
+
+**Inherited errors are reported, not swallowed.** Not failing the module is
+right; leaving real bugs unmentioned forever is not. So they are surfaced three
+ways, with the owning module named from the ledger's `filesWritten` — the same
+mapping that made the M06 failure diagnosable in the first place:
+
+- **Per module, in the run log**, marked as pre-existing and explicitly not this
+  module's fault (five lines then a count, the rest in the ledger):
+
+  ```
+        inherited: 3 pre-existing typecheck error(s) in files M06 did not write — NOT its fault and not counted against it (owners: M04 x2, M01 x1)
+          [revealed-by-install, owner M01] src/m01/redis.ts(2,20): error TS2351: This expression is not constructable.
+          [pre-existing, owner M04] src/m04/TrustChecklist.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'.
+  ```
+
+- **In the ledger**, as `entries[].inheritedDiagnostics`, so the record is
+  durable and the reviewer stage can act on it later.
+- **At the end of the stage**, as a count by owner, because an error that fails
+  nobody and is reported to nobody never gets fixed:
+
+  ```
+    inherited typecheck errors outstanding at end of stage: 3 across 3 file(s), owned by 2 module(s)
+      M04: 2 error(s) in 2 file(s) — src/m04/CostBadge.ts, src/m04/TrustChecklist.ts
+      M01: 1 error(s) in 1 file(s) — src/m01/redis.ts
+      these failed no module and are recorded per attempt in pipeline-progress.json (entries[].inheritedDiagnostics); the reviewer stage can act on them
+  ```
+
+Somebody has to decide to fix these. The pipeline's job is to make that visible,
+not to hide it and not to bill it to the wrong module.
 
 **What the stub detector actually catches.** "It wrote files" is trivially
 satisfiable, and the cheapest way to satisfy it is a placeholder, so this check
@@ -992,6 +1088,11 @@ agent-pipeline/
                                 set changes. Never throws: a failed install
                                 falls back to TS2307-as-warning.
                    verify.ts    per-module verification + stub detection
+                   baseline.ts  whose typecheck error is this: baselines the
+                                workspace's diagnostics before each module and
+                                charges it only what is new or in a file it
+                                touched. Handles the mid-stage dependency
+                                install that changes what `tsc` can see.
                    progress.ts  the workspace progress log / resume ledger
                    module-prompt.ts
                                 the per-module spec-implementer prompt.

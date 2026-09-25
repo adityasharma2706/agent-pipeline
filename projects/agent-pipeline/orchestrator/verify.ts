@@ -5,6 +5,8 @@
 // satisfy it is a stub. So each module is judged on four orthogonal checks
 // (files written, typecheck, stub density, REQ scope), all run by this process.
 
+import type { AttributionResult, DiagnosticBaseline, InheritedDiagnostic } from "./baseline.js";
+import { attributeDiagnostics, emptyBaseline } from "./baseline.js";
 import type { InstallOutcome } from "./deps.js";
 import type { ModuleSpec } from "./modules.js";
 import type { ModuleFailureKind } from "./retry-context.js";
@@ -244,17 +246,26 @@ export interface ModuleVerification {
   /** Non-fatal observations worth recording (missing deps, absent report). */
   warnings: string[];
   /**
-   * The typecheck diagnostics that COUNT for this module: always
-   * `typecheck.errors`, plus the TS2307 lines when a dependency install has
-   * succeeded for the currently declared set. Callers that record the failure
-   * for the next attempt must use this rather than `typecheck.errors`, or the
-   * retried agent is never told which import it failed to declare.
+   * The typecheck diagnostics that COUNT for this module: `typecheck.errors`
+   * plus the TS2307 lines when a dependency install has succeeded for the
+   * currently declared set, MINUS everything attribution judged to belong to an
+   * earlier module (see `inherited`). Callers that record the failure for the
+   * next attempt must use this rather than `typecheck.errors`, or the retried
+   * agent is told to fix code it never wrote — which is precisely how M06 burned
+   * three attempts and $2.78 on seven errors belonging to M01 and M04.
    */
   typecheckErrors: string[];
   /**
+   * Diagnostics that were present before this module ran, or that a dependency
+   * install revealed mid-attempt, in files this module never touched. They do
+   * NOT fail it. They are real bugs owned by somebody, so they are logged and
+   * written to the ledger rather than dropped.
+   */
+  inherited: InheritedDiagnostic[];
+  /**
    * TS2307 lines promoted to errors because the packages ARE installed, i.e.
-   * imports of things absent from package.json. Empty whenever no install has
-   * succeeded.
+   * imports of things absent from package.json, AND attributed to this module.
+   * Empty whenever no install has succeeded.
    */
   undeclaredImports: string[];
   filesWritten: string[];
@@ -297,6 +308,34 @@ function unresolvedImportsAreExpectedBecause(status: DependencyState["status"]):
 }
 
 /**
+ * What verifyModule needs in order to tell this module's typecheck errors from
+ * the ones it walked in on.
+ */
+export interface AttributionContext {
+  /** The workspace's diagnostics captured BEFORE this module's query() call. */
+  baseline: DiagnosticBaseline;
+  /**
+   * Whether `npm install` actually ran during this attempt. Only "installed"
+   * counts: "unchanged" means node_modules already matched the declared set, so
+   * nothing became newly visible to tsc.
+   */
+  installRan: boolean;
+  /** file -> owning module, from the ledger's filesWritten (see fileOwners). */
+  owners: ReadonlyMap<string, string>;
+}
+
+/**
+ * The context that reproduces the pre-attribution behaviour: an empty baseline
+ * and no install, so every diagnostic is new and every diagnostic is owned.
+ * The default for callers that have no baseline to offer.
+ */
+export const NO_BASELINE: AttributionContext = {
+  baseline: emptyBaseline("none"),
+  installRan: false,
+  owners: new Map(),
+};
+
+/**
  * Applies the four checks in cheapest-first order and stops at the first
  * failure, so the recorded reason is the actual one rather than a pile.
  *
@@ -319,7 +358,8 @@ export async function verifyModule(
   filesWritten: string[],
   reported: ReportedProgress,
   typecheck: TypecheckResult,
-  deps: DependencyState = NO_DEPENDENCY_INSTALL
+  deps: DependencyState = NO_DEPENDENCY_INSTALL,
+  attribution: AttributionContext = NO_BASELINE
 ): Promise<ModuleVerification> {
   const warnings: string[] = [];
   if (!reported.found) {
@@ -339,7 +379,19 @@ export async function verifyModule(
       warnings.push(`unresolved import (expected — ${why}): ${warning}`);
     }
   }
-  const typecheckErrors = [...typecheck.errors, ...undeclaredImports];
+  // Everything that WOULD have failed the module before attribution existed.
+  // Both buckets go through it: an undeclared import in M04's file is no more
+  // M06's problem than a TS2345 in it is.
+  const candidateErrors = [...typecheck.errors, ...undeclaredImports];
+  const attributed: AttributionResult = attributeDiagnostics({
+    diagnostics: candidateErrors,
+    baseline: attribution.baseline,
+    filesTouched: filesWritten,
+    installRan: attribution.installRan,
+    owners: attribution.owners,
+  });
+  const typecheckErrors = attributed.owned;
+  const inherited = attributed.inherited;
 
   const empty: StubReport = {
     isStub: false,
@@ -348,13 +400,22 @@ export async function verifyModule(
     codeLines: 0,
     codeFileCount: 0,
   };
+  // Narrowed to the ones this module actually owns, for the same reason as
+  // typecheckErrors: telling M06 to declare a dependency for an import that M04
+  // wrote sends it editing a package.json entry it has no business guessing at.
+  const ownedLines = new Set(typecheckErrors);
+  const ownedUndeclaredImports = undeclaredImports
+    .map((line) => line.trim())
+    .filter((line) => ownedLines.has(line));
+
   const base = {
     warnings,
     filesWritten,
     reqsClaimed: reported.reqs,
     typecheck,
     typecheckErrors,
-    undeclaredImports,
+    inherited,
+    undeclaredImports: ownedUndeclaredImports,
     unownedReqs: [] as string[],
   };
 
@@ -405,9 +466,9 @@ export async function verifyModule(
     // package.json. A generic "tsc reported errors" would send it editing code
     // that is probably correct.
     const undeclaredNote =
-      undeclaredImports.length === 0
+      ownedUndeclaredImports.length === 0
         ? ""
-        : `\n      ${undeclaredImports.length} of these are imports of packages that are NOT in ` +
+        : `\n      ${ownedUndeclaredImports.length} of these are imports of packages that are NOT in ` +
           `the workspace package.json — the declared dependencies installed successfully, so ` +
           `these modules are genuinely missing a dependency declaration, not merely uninstalled.`;
     return {

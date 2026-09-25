@@ -12,7 +12,9 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { InheritedDiagnostic } from "./baseline.js";
 import type { ModuleFailureRecord } from "./retry-context.js";
+import { describeInheritedOwners } from "./baseline.js";
 import { PROGRESS_JSON, PROGRESS_MD, workspaceRoot } from "./workspace.js";
 
 export interface ModuleProgressEntry {
@@ -42,6 +44,19 @@ export interface ModuleProgressEntry {
    * gracefully for rather than rejecting.
    */
   failure?: ModuleFailureRecord;
+  /**
+   * Typecheck diagnostics that were present BEFORE this module ran (or that a
+   * dependency install revealed during its attempt) in files it never touched.
+   *
+   * They did not fail it, and they must not: they belong to whichever earlier
+   * module wrote the file, named here in `owner` where the ledger can identify
+   * it. They are recorded rather than merely logged so they are durable —
+   * somebody has to decide to fix them, and the reviewer stage reads this file.
+   *
+   * Optional and absent when there were none, and on every entry written before
+   * the field existed.
+   */
+  inheritedDiagnostics?: InheritedDiagnostic[];
   /** Deviation notes the agent reported, verbatim. */
   deviations: string | null;
   /** Non-fatal observations (unresolved imports, missing self-report). */
@@ -148,6 +163,25 @@ function isFailureRecord(value: unknown): value is ModuleFailureRecord {
   );
 }
 
+/**
+ * Validates `entries[].inheritedDiagnostics` when present.
+ *
+ * Rejected rather than repaired, like `failure`: these lines are the pipeline's
+ * only durable record that a real bug exists and belongs to somebody, and a
+ * half-parsed one is a bug that quietly stops being reported.
+ */
+function isInheritedDiagnostic(value: unknown): value is InheritedDiagnostic {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.diagnostic === "string" &&
+    typeof item.file === "string" &&
+    typeof item.code === "string" &&
+    (item.reason === "pre-existing" || item.reason === "revealed-by-install") &&
+    (item.owner === null || typeof item.owner === "string")
+  );
+}
+
 function isEntry(value: unknown): value is ModuleProgressEntry {
   if (typeof value !== "object" || value === null) return false;
   const entry = value as Record<string, unknown>;
@@ -155,7 +189,10 @@ function isEntry(value: unknown): value is ModuleProgressEntry {
     typeof entry.moduleId === "string" &&
     (entry.outcome === "success" || entry.outcome === "failure") &&
     Array.isArray(entry.filesWritten) &&
-    (entry.failure === undefined || isFailureRecord(entry.failure))
+    (entry.failure === undefined || isFailureRecord(entry.failure)) &&
+    (entry.inheritedDiagnostics === undefined ||
+      (Array.isArray(entry.inheritedDiagnostics) &&
+        entry.inheritedDiagnostics.every(isInheritedDiagnostic)))
   );
 }
 
@@ -281,6 +318,16 @@ function renderMarkdown(log: ProgressLog): string {
     if (entry.failureReason !== null) lines.push(`- Failed because: ${entry.failureReason}`);
     if (entry.failure !== undefined) {
       lines.push(`- Failure kind: ${entry.failure.kind} (fed back into the next attempt's prompt)`);
+    }
+    const inherited = entry.inheritedDiagnostics ?? [];
+    if (inherited.length > 0) {
+      lines.push(
+        `- Inherited ${inherited.length} pre-existing typecheck error(s) — NOT this module's fault, ` +
+          `not counted against it: ${describeInheritedOwners(inherited)}`
+      );
+      for (const item of inherited) {
+        lines.push(`  - [${item.reason}, owner ${item.owner ?? "unattributed"}] ${item.diagnostic}`);
+      }
     }
     if (entry.deviations !== null) lines.push(`- Deviations reported: ${entry.deviations}`);
     for (const warning of entry.warnings) lines.push(`- Warning: ${warning}`);
