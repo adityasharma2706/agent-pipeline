@@ -51,6 +51,122 @@ export function workspaceRoot(): string {
 }
 
 /**
+ * What kind of product the workspace's package.json says it is.
+ *
+ * This is deliberately a THREE-valued answer rather than a boolean, because the
+ * three cases want genuinely different compiler options and collapsing any two
+ * of them degrades one of them.
+ */
+export type WorkspaceRuntime =
+  /** `next` is declared: a Next.js app, typechecked the way create-next-app does. */
+  | "next"
+  /** `react` without `next`: a React library/app compiled by some other bundler. */
+  | "react"
+  /** Neither: a plain Node library, which is what this pipeline started out assuming. */
+  | "node";
+
+/**
+ * WHY THE CONFIG IS DERIVED RATHER THAN FIXED
+ * -------------------------------------------
+ * A fixed Node-library tsconfig does not merely fail to help a web product — it
+ * SHAPES it. With `jsx` unset, `tsc` rejects every `.tsx` file outright
+ * (TS17004), so the agent, which is verified by this typecheck, writes
+ * `createElement as h(...)` calls instead of JSX. With `moduleResolution:
+ * NodeNext`, `import { notFound } from 'next/navigation'` — the import every
+ * Next.js codebase writes — fails TS2307, and a repair pass "fixes" it to
+ * `'next/navigation.js'`. Both artefacts were observed in the live workspace.
+ * Neither is a bug the agent chose; both are the verifier's config leaking into
+ * the product's source.
+ *
+ * So the config follows the product's own declaration. The reference for the
+ * Next case is what `create-next-app --typescript` generates, not invention.
+ *
+ * `strict: true` is NOT derived. It is the verifier's value and holds in every
+ * case.
+ */
+function compilerOptionsFor(runtime: WorkspaceRuntime): Record<string, unknown> {
+  switch (runtime) {
+    case "next":
+      // create-next-app's TS template, minus the two pieces that are not ours
+      // to invent: `paths` (the product's own alias scheme) and `plugins`
+      // (a tsserver-only plugin that `tsc --noEmit` ignores). `incremental` is
+      // also left off — it writes a .tsbuildinfo into the workspace that would
+      // show up in `changedFiles()` as output the agent did not write.
+      return {
+        target: "ES2022",
+        module: "esnext",
+        moduleResolution: "bundler",
+        jsx: "preserve",
+        lib: ["ES2022", "DOM", "DOM.Iterable"],
+        strict: true,
+        noEmit: true,
+        allowJs: true,
+        skipLibCheck: true,
+        esModuleInterop: true,
+        allowSyntheticDefaultImports: true,
+        forceConsistentCasingInFileNames: true,
+        resolveJsonModule: true,
+        isolatedModules: true,
+      };
+    case "react":
+      // No Next.js compiler to hand the JSX to, so it is compiled here:
+      // `react-jsx` is the automatic runtime, which needs no `import React`.
+      return {
+        target: "ES2022",
+        module: "esnext",
+        moduleResolution: "bundler",
+        jsx: "react-jsx",
+        lib: ["ES2022", "DOM", "DOM.Iterable"],
+        strict: true,
+        noEmit: true,
+        skipLibCheck: true,
+        esModuleInterop: true,
+        allowSyntheticDefaultImports: true,
+        forceConsistentCasingInFileNames: true,
+        resolveJsonModule: true,
+        isolatedModules: true,
+      };
+    case "node":
+      // Byte-for-byte what this file has always emitted. Non-web products must
+      // be completely unaffected by the two branches above.
+      return {
+        target: "ES2022",
+        module: "NodeNext",
+        moduleResolution: "NodeNext",
+        lib: ["ES2022", "DOM"],
+        strict: true,
+        noEmit: true,
+        skipLibCheck: true,
+        esModuleInterop: true,
+        allowSyntheticDefaultImports: true,
+        forceConsistentCasingInFileNames: true,
+        resolveJsonModule: true,
+      };
+  }
+}
+
+/**
+ * The runtime a manifest declares. `next` wins over `react` because every Next
+ * app also declares `react`, and the Next answer is the more specific one.
+ *
+ * Both `dependencies` and `devDependencies` are consulted: which of the two a
+ * model puts `next` in is not a fact worth depending on.
+ */
+export function detectWorkspaceRuntime(manifest: unknown): WorkspaceRuntime {
+  if (typeof manifest !== "object" || manifest === null) return "node";
+  const record = manifest as Record<string, unknown>;
+  const declared = new Set<string>();
+  for (const field of ["dependencies", "devDependencies"] as const) {
+    const section = record[field];
+    if (typeof section !== "object" || section === null || Array.isArray(section)) continue;
+    for (const name of Object.keys(section as Record<string, unknown>)) declared.add(name);
+  }
+  if (declared.has("next")) return "next";
+  if (declared.has("react")) return "react";
+  return "node";
+}
+
+/**
  * The workspace tsconfig.
  *
  * Two non-obvious choices, both forced by the same fact — the agent has no
@@ -71,22 +187,12 @@ export function workspaceRoot(): string {
  * install a TS2307 means an UNDECLARED import and fails the module. See
  * classifyTypecheck and verifyModule.
  */
-function workspaceTsconfig(): string {
+export function workspaceTsconfig(runtime: WorkspaceRuntime = "node"): string {
   const typeRoots = path.join(PROJECT_ROOT, "node_modules", "@types");
   return `${JSON.stringify(
     {
       compilerOptions: {
-        target: "ES2022",
-        module: "NodeNext",
-        moduleResolution: "NodeNext",
-        lib: ["ES2022", "DOM"],
-        strict: true,
-        noEmit: true,
-        skipLibCheck: true,
-        esModuleInterop: true,
-        allowSyntheticDefaultImports: true,
-        forceConsistentCasingInFileNames: true,
-        resolveJsonModule: true,
+        ...compilerOptionsFor(runtime),
         typeRoots: ["./node_modules/@types", typeRoots],
       },
       include: ["**/*.ts", "**/*.tsx"],
@@ -95,6 +201,81 @@ function workspaceTsconfig(): string {
     null,
     2
   )}\n`;
+}
+
+export interface TsconfigSyncResult {
+  /** What the manifest was read as. "node" is also the fallback on a bad read. */
+  runtime: WorkspaceRuntime;
+  /** True only when the file on disk actually differed and was replaced. */
+  rewritten: boolean;
+  /** Human-facing lines for the run log, already prefixed. */
+  log: string[];
+}
+
+/**
+ * Re-derives the workspace tsconfig from the currently declared dependencies
+ * and writes it only if the content actually changed.
+ *
+ * WHY THIS IS NOT A BOOTSTRAP-ONLY CONCERN. At bootstrap the workspace
+ * package.json declares nothing at all — modules add dependencies as they build
+ * — so the runtime is unknowable then and `ensureWorkspace` can only emit the
+ * "node" config. The answer changes the moment a module declares `next`. This
+ * is therefore called from orchestrator/deps.ts, which already sits at exactly
+ * the point where the declared set may have just changed, and always BEFORE the
+ * typecheck that the config governs.
+ *
+ * The compare-before-write is not an optimisation: rewriting an identical file
+ * would set `rewritten`, and `rewritten` buys the current module an attribution
+ * allowance it has not earned (see attributeDiagnostics). An unchanged run must
+ * report false.
+ *
+ * NEVER THROWS, for the same reason deps.ts does not: a workspace whose
+ * tsconfig could not be re-derived still typechecks with the one already there.
+ */
+export async function syncWorkspaceTsconfig(root?: string): Promise<TsconfigSyncResult> {
+  const dir = root ?? workspaceRoot();
+  const file = path.join(dir, "tsconfig.json");
+
+  let manifest: unknown = null;
+  try {
+    manifest = JSON.parse(await readFile(path.join(dir, "package.json"), "utf-8")) as unknown;
+  } catch {
+    // No readable manifest: nothing declares anything, so there is nothing to
+    // derive from and the existing file is left exactly as it is.
+    return { runtime: "node", rewritten: false, log: [] };
+  }
+
+  const runtime = detectWorkspaceRuntime(manifest);
+  const desired = workspaceTsconfig(runtime);
+
+  let current: string | null = null;
+  try {
+    current = await readFile(file, "utf-8");
+  } catch {
+    current = null;
+  }
+  if (current === desired) return { runtime, rewritten: false, log: [] };
+
+  try {
+    await writeFile(file, desired, "utf-8");
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      runtime,
+      rewritten: false,
+      log: [`[tsconfig] could not rewrite the workspace tsconfig (keeping the existing one): ${detail}`],
+    };
+  }
+
+  return {
+    runtime,
+    rewritten: true,
+    log: [
+      `[tsconfig] workspace tsconfig re-derived for a "${runtime}" product from the currently ` +
+        `declared dependencies and rewritten; the diagnostic set for the WHOLE workspace may ` +
+        `have changed as a result`,
+    ],
+  };
 }
 
 function workspacePackageJson(): string {

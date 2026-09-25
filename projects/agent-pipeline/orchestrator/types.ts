@@ -22,8 +22,16 @@ export const PIPELINE_STAGES = [
 
 export type PipelineStage = (typeof PIPELINE_STAGES)[number];
 
-/** Agents that exist but are not part of the linear PIPELINE_STAGES order. */
-export type AuxiliaryAgent = "feedback-router" | "critic";
+/**
+ * Agents that exist but are not part of the linear PIPELINE_STAGES order.
+ *
+ * `critic` and `repairer` are both ON DEMAND — invoked by hand with a specific
+ * target, never scheduled and never called from the module loop. Adding either
+ * to PIPELINE_STAGES would make it run on every pass; see the header of
+ * orchestrator/repair.ts for why that is the thing to avoid rather than the
+ * obvious next step.
+ */
+export type AuxiliaryAgent = "feedback-router" | "critic" | "repairer";
 
 export type AgentName = PipelineStage | AuxiliaryAgent;
 

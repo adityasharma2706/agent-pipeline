@@ -89,12 +89,25 @@ import {
 } from "./workspace.js";
 import {
   appendProgress,
+  appendRepair,
   checkLedgerProvenance,
   completedModuleIds,
   hashDocument,
   loadProgress,
+  nextRepairId,
 } from "./progress.js";
-import type { LedgerIdentity, ProgressLog } from "./progress.js";
+import type { LedgerIdentity, ProgressLog, RepairRecord } from "./progress.js";
+import {
+  buildRepairPrompt,
+  describeTargetOwners,
+  judgeRepair,
+  ownersWithDiagnostics,
+  selectRepairTargets,
+  targetFiles,
+} from "./repair.js";
+import type { RepairTarget } from "./repair.js";
+import { workspaceVcs } from "./vcs.js";
+import type { WorkspaceCommit } from "./vcs.js";
 import { parseReportedProgress, verifyModule } from "./verify.js";
 import {
   baselineFrom,
@@ -172,6 +185,33 @@ const MIN_BUDGET_HEADROOM_USD = 0.5;
  * ledger regardless; this only bounds the console.
  */
 const MAX_INHERITED_LOG_LINES = 5;
+
+/**
+ * Per-invocation spend cap for one `--repair` session.
+ *
+ * Lower than MAX_BUDGET_USD_PER_STAGE ($8) on purpose, and not out of caution:
+ * the two calls are different sizes. A module call writes a whole module from a
+ * specification; a repair opens a handful of existing files and changes a
+ * handful of lines in them, with the entire job description pasted into the
+ * prompt. The seven-error case that motivated this touches four files.
+ *
+ * It is also the one cap here that should bite rather than be generous
+ * headroom. A repairer that has spent $3 has stopped making small edits to
+ * named lines and started doing something else, and the right response to that
+ * is to stop it and let a human look — the work is rolled back either way, so
+ * an early cap costs the difference in tokens and nothing more.
+ */
+const MAX_BUDGET_USD_PER_REPAIR = 3.0;
+
+/** `--repair`, named once so the parser, the messages and the README agree. */
+const REPAIR_FLAG = "--repair";
+
+/**
+ * Sentinel for `--repair` given with no module id: repair everything
+ * outstanding. It cannot be `null`, because null already means "the flag was
+ * not passed at all", and those two have to stay distinguishable in CliArgs.
+ */
+const REPAIR_ALL = "__all__";
 
 /**
  * How many modules one invocation may build.
@@ -1142,9 +1182,23 @@ async function runModuleStage(
             `unresolved are treated as pre-existing, not as ${spec.id}'s`
         );
       }
+      // The second door into the same trap. Re-deriving the workspace tsconfig
+      // (deps.ts, when the declared dependency set changes what the config
+      // should be) changes the diagnostic set for every file at once, exactly as
+      // an install does. Only an actual REWRITE counts; a re-derivation that
+      // produced identical content changed nothing and buys no allowance.
+      const tsconfigRewritten = deps.tsconfigRewritten;
+      if (tsconfigRewritten) {
+        console.log(
+          `      baseline: the workspace tsconfig was re-derived for a "${deps.tsconfigRuntime}" ` +
+            `product and rewritten during this attempt, so errors newly visible in files ` +
+            `${spec.id} did not touch are treated as pre-existing, not as its`
+        );
+      }
       const verification = await verifyModule(spec, written, reported, typecheck, deps, {
         baseline,
         installRan,
+        tsconfigRewritten,
         // Built from the ledger written so far: filesWritten is what makes
         // "who owns this file" answerable at all.
         owners: fileOwners(progress.entries),
@@ -1719,6 +1773,296 @@ async function invokeCritic(target: string, budget: RunBudget): Promise<boolean>
 }
 
 /**
+ * Repairs typecheck errors that no module owns. ON DEMAND ONLY.
+ *
+ * Read orchestrator/repair.ts' header first: it has the reason this is an
+ * auxiliary agent rather than a pipeline stage, and the reason is evidence
+ * about multi-agent pipelines rather than a preference about code layout.
+ *
+ * `moduleId` is null to repair every outstanding diagnostic, or a module id to
+ * repair only the ones in files that module wrote.
+ *
+ * The sequence, and why it is in this order:
+ *
+ *   1. refuse without git      — the rollback IS the safety property
+ *   2. fresh typecheck         — the ledger records history; tsc records now
+ *   3. snapshot commit         — before anything can be edited
+ *   4. one query()
+ *   5. fresh typecheck + judge — targets gone AND nothing new anywhere
+ *   6. accept, or restore the snapshot
+ *   7. record the outcome in the ledger, AFTER any restore
+ *
+ * Step 7 is last for a mechanical reason: the ledger is a tracked file, so a
+ * `git reset --hard` would erase a record written before it.
+ */
+async function invokeRepairer(moduleId: string | null, budget: RunBudget): Promise<boolean> {
+  const startedAt = new Date().toISOString();
+  await ensureWorkspace();
+  const vcs = workspaceVcs();
+  const log0 = await loadProgress();
+  const repairId = nextRepairId(log0);
+
+  const finish = async (
+    partial: Omit<RepairRecord, "repairId" | "startedAt" | "finishedAt" | "targetOwners"> & {
+      targetOwners?: string;
+    }
+  ): Promise<void> => {
+    await appendRepair(await loadProgress(), {
+      repairId,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      targetOwners: partial.targetOwners ?? "none",
+      ...partial,
+    });
+    console.log(`Recorded as ${repairId} in the workspace ledger (${PROGRESS_JSON}).`);
+  };
+
+  // 1. No git, no repair. This is the only safeguard standing between a bad
+  // edit and another module's source, so its absence is a refusal rather than
+  // a warning — "repaired without a way back" is not a thing to offer.
+  const unavailable = await vcs.check();
+  if (unavailable !== null) {
+    console.error(`Refusing to run the repairer: ${unavailable}`);
+    console.error("");
+    console.error(
+      "A repair edits files that another module wrote, and is kept only if a fresh typecheck"
+    );
+    console.error(
+      "accepts it. Without git there is no way to undo one that is not accepted, so nothing runs."
+    );
+    await finish({
+      targetModuleId: moduleId,
+      targeted: [],
+      filesChanged: [],
+      outcome: "declined",
+      reason: `git unavailable: ${unavailable}`,
+      remaining: [],
+      regressions: [],
+      snapshotCommit: null,
+      costUsd: 0,
+      numTurns: 0,
+    });
+    return false;
+  }
+
+  // 2. What is broken NOW. Not the ledger's inheritedDiagnostics: those record
+  // what was broken during some past module attempt, and may since have been
+  // fixed, moved, or joined by errors no attempt ever saw. The ledger's job
+  // here is only the part tsc cannot do — whose file each diagnostic is in.
+  console.log("Typechecking the workspace to find what is actually broken right now...");
+  const before = await typecheckWorkspace();
+  const owners = fileOwners(log0.entries);
+  const all = selectRepairTargets({ typecheck: before, owners, moduleId: null });
+  const selected = selectRepairTargets({ typecheck: before, owners, moduleId });
+  const targets = selected.targets;
+
+  for (const line of all.unfixable) {
+    console.warn(`  [repair] not attributable to a file, skipped: ${line}`);
+  }
+
+  if (targets.length === 0) {
+    const scope = moduleId === null ? "the workspace" : `files written by ${moduleId}`;
+    if (moduleId !== null && all.targets.length > 0) {
+      // A named module with nothing wrong is worth distinguishing from a clean
+      // workspace: the caller probably meant a different module id.
+      console.log(`Nothing to repair in files written by ${moduleId}.`);
+      console.log(
+        `Modules that DO have outstanding diagnostics: ${ownersWithDiagnostics(all.targets).join(", ") || "(none)"}.`
+      );
+    } else {
+      console.log(`Nothing to repair: ${scope} has no attributable typecheck diagnostics.`);
+    }
+    await finish({
+      targetModuleId: moduleId,
+      targeted: [],
+      filesChanged: [],
+      outcome: "declined",
+      reason: "nothing to repair",
+      remaining: [],
+      regressions: [],
+      snapshotCommit: null,
+      costUsd: 0,
+      numTurns: 0,
+    });
+    return true;
+  }
+
+  const owned = describeTargetOwners(targets);
+  const files = targetFiles(targets);
+  console.log("");
+  console.log(`${targets.length} diagnostic(s) to repair across ${files.length} file(s) [${owned}]:`);
+  for (const target of targets) console.log(`  ${target.parsed.raw}`);
+  console.log("");
+
+  // 3. The point of no return, made returnable.
+  let snapshot: WorkspaceCommit;
+  try {
+    snapshot = await vcs.snapshot(`pipeline: pre-repair snapshot for ${repairId}`);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error(`Refusing to run the repairer: could not snapshot the workspace: ${detail}`);
+    await finish({
+      targetModuleId: moduleId,
+      targeted: targets.map((t) => t.parsed.raw),
+      targetOwners: owned,
+      filesChanged: [],
+      outcome: "declined",
+      reason: `snapshot failed: ${detail}`,
+      remaining: [],
+      regressions: [],
+      snapshotCommit: null,
+      costUsd: 0,
+      numTurns: 0,
+    });
+    return false;
+  }
+  console.log(
+    `Workspace snapshotted at ${snapshot.sha.slice(0, 10)}` +
+      `${snapshot.isInitialCommit ? " (the repository's first commit — it had no history)" : ""}. ` +
+      `A repair that is not accepted resets to it.`
+  );
+
+  const rollBack = async (reason: string, verdict: { remaining: string[]; regressions: string[] }, changed: string[], costUsd: number, numTurns: number): Promise<void> => {
+    try {
+      await vcs.restore(snapshot);
+      console.log(`Workspace reset to ${snapshot.sha.slice(0, 10)} — nothing from this repair was kept.`);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.error(`ROLLBACK FAILED: ${detail}`);
+      console.error(`Reset it yourself: git -C ${vcs.root} reset --hard ${snapshot.sha} && git -C ${vcs.root} clean -fd`);
+    }
+    await finish({
+      targetModuleId: moduleId,
+      targeted: targets.map((t) => t.parsed.raw),
+      targetOwners: owned,
+      filesChanged: changed,
+      outcome: "rolled-back",
+      reason,
+      remaining: verdict.remaining,
+      regressions: verdict.regressions,
+      snapshotCommit: snapshot.sha,
+      costUsd,
+      numTurns,
+    });
+  };
+
+  // 4. One call. There is no retry loop: a repair that failed verification has
+  // already been rolled back, so a second attempt would start from the same
+  // state with the same prompt and re-roll blind. Re-running it is the human's
+  // decision, and it is one command.
+  const definition = await loadAgentDefinition("repairer");
+  const prompt = buildRepairPrompt({ targets, workspace: vcs.root, moduleId });
+  const allowanceUsd = budget.allowanceFor(MAX_BUDGET_USD_PER_REPAIR);
+  const snapshotBefore = await snapshotWorkspace();
+
+  const outcome = await runQueryOnce("repairer", definition, "repairer", prompt, {
+    cwd: vcs.root,
+    maxBudgetUsd: allowanceUsd,
+    additionalDirectories: [DOCS_DIR],
+  });
+  budget.record(outcome.costUsd);
+  haltIfUsageLimit("repairer", outcome);
+
+  const changed = changedFiles(snapshotBefore, await snapshotWorkspace());
+
+  if (outcome.deterministic !== null) {
+    console.error(
+      buildDeterministicHaltMessage({
+        label: "repairer",
+        failure: outcome.deterministic,
+        costUsd: outcome.costUsd,
+        numTurns: outcome.numTurns,
+        allowanceUsd,
+        perStageCapUsd: MAX_BUDGET_USD_PER_REPAIR,
+        artifact: null,
+        acceptCommand: null,
+      })
+    );
+    // A capped repair is mid-edit by definition, so it is rolled back without
+    // being verified: half a fix is the one outcome nothing downstream can
+    // reason about.
+    await rollBack(
+      `the call hit a deterministic cap (${outcome.deterministic.subtype}) and was rolled back mid-edit`,
+      { remaining: targets.map((t) => t.parsed.raw), regressions: [] },
+      changed,
+      outcome.costUsd,
+      outcome.numTurns
+    );
+    return false;
+  }
+
+  if (!outcome.ok) {
+    console.error(`repairer failed: ${outcome.text.slice(0, 500)}`);
+    await rollBack(
+      "the repairer call failed",
+      { remaining: targets.map((t) => t.parsed.raw), regressions: [] },
+      changed,
+      outcome.costUsd,
+      outcome.numTurns
+    );
+    return false;
+  }
+
+  if (outcome.text.trim().length > 0) {
+    console.log("");
+    console.log(outcome.text.trim());
+    console.log("");
+  }
+
+  // 5. The orchestrator's own check. The agent's report is not evidence.
+  console.log("Re-typechecking the workspace to verify the repair...");
+  const after = await typecheckWorkspace();
+  const verdict = judgeRepair(before, after, targets);
+
+  console.log("");
+  console.log(`Fixed:       ${verdict.fixed.length} of ${targets.length} targeted diagnostic(s).`);
+  console.log(`Still there: ${verdict.remaining.length}`);
+  console.log(`NEW errors:  ${verdict.regressions.length}`);
+
+  if (!verdict.accepted) {
+    // 6b. Rejected. The regression count is the important half: a repair that
+    // fixes three and introduces two is not a repair, and there is no partial
+    // credit because the edits that fixed and the edits that broke cannot be
+    // separated from here.
+    console.error("");
+    console.error("Repair REJECTED.");
+    for (const line of verdict.remaining) console.error(`  still broken: ${line}`);
+    for (const line of verdict.regressions) console.error(`  NEW:          ${line}`);
+    const reason =
+      verdict.regressions.length > 0
+        ? `introduced ${verdict.regressions.length} new diagnostic(s)` +
+          (verdict.remaining.length > 0 ? ` and left ${verdict.remaining.length} unfixed` : "")
+        : `left ${verdict.remaining.length} targeted diagnostic(s) unfixed`;
+    await rollBack(reason, verdict, changed, outcome.costUsd, outcome.numTurns);
+    console.log(`Cost: $${outcome.costUsd.toFixed(4)} over ${outcome.numTurns} turns.`);
+    return false;
+  }
+
+  // 6a. Accepted: the snapshot commit stays in the history as the "before", and
+  // the edits stay in the working tree. They are NOT committed — committing the
+  // generated product's code is the product's own business, and the pipeline
+  // only commits in order to be able to undo itself.
+  console.log("");
+  console.log(`Repair ACCEPTED — all ${targets.length} targeted diagnostic(s) fixed, nothing new anywhere.`);
+  console.log(`Files changed: ${changed.length > 0 ? changed.join(", ") : "(none)"}`);
+  await finish({
+    targetModuleId: moduleId,
+    targeted: targets.map((t) => t.parsed.raw),
+    targetOwners: owned,
+    filesChanged: changed,
+    outcome: "accepted",
+    reason: `all ${targets.length} targeted diagnostic(s) fixed with no new diagnostics anywhere`,
+    remaining: [],
+    regressions: [],
+    snapshotCommit: snapshot.sha,
+    costUsd: outcome.costUsd,
+    numTurns: outcome.numTurns,
+  });
+  console.log(`Cost: $${outcome.costUsd.toFixed(4)} over ${outcome.numTurns} turns.`);
+  return true;
+}
+
+/**
  * The stages run in this linear order by default. feedback-router (once
  * implemented) can redirect the control loop back to any earlier stage in
  * this list rather than advancing linearly.
@@ -1737,6 +2081,7 @@ export {
   runStage,
   invokeFeedbackRouter,
   invokeCritic,
+  invokeRepairer,
   driveFeedbackLoop,
   estimateGoBackUsd,
   nextLinearStage,
@@ -1832,10 +2177,29 @@ interface CliArgs {
    * alternative to running the pipeline — it spends nothing and starts no stage.
    */
   acceptStage: PipelineStage | null;
+  /**
+   * `--repair` (every outstanding diagnostic) or `--repair <MODULE_ID>` (just
+   * that module's). REPAIR_ALL is the no-argument form; null means the flag was
+   * not passed, and those two must stay distinguishable.
+   *
+   * Like --critic and --accept-stage it is a complete alternative to running
+   * the pipeline: no stage runs and no run state is touched.
+   */
+  repair: string | null;
 }
 
 const FLAGS_WITH_VALUES = ["--max-modules", "--max-go-backs", "--critic", ACCEPT_STAGE_FLAG] as const;
 const BOOLEAN_FLAGS = ["--force-idea", "--no-install"] as const;
+
+/**
+ * `--repair` is in neither list: its value is OPTIONAL, which neither of the
+ * two existing shapes allows. `--repair M04` targets one module and bare
+ * `--repair` targets everything, so it may consume the next argv entry only
+ * when that entry looks like a module id — otherwise `--repair "an app that
+ * does X"` would silently swallow the idea text, which is the bug
+ * parseCliArgs was written to prevent in the first place.
+ */
+const REPAIR_MODULE_RE = /^M\d{2,}$/;
 
 /**
  * Splits `--flags` out of the product idea. Before Phase 4 every argument was
@@ -1850,6 +2214,7 @@ function parseCliArgs(argv: string[]): CliArgs {
   let forceIdea = false;
   let installDeps = true;
   let acceptStage: PipelineStage | null = null;
+  let repair: string | null = null;
 
   const knownStage = (value: string | undefined): PipelineStage => {
     const implemented = PIPELINE_STAGES.filter(isImplemented);
@@ -1881,6 +2246,28 @@ function parseCliArgs(argv: string[]): CliArgs {
     const name = eq === -1 ? arg : arg.slice(0, eq);
     let value = eq === -1 ? undefined : arg.slice(eq + 1);
 
+    if (name === REPAIR_FLAG) {
+      if (value !== undefined) {
+        const given = value.trim();
+        if (!REPAIR_MODULE_RE.test(given)) {
+          throw new Error(
+            `${REPAIR_FLAG} takes a module id like M04, got "${given}". ` +
+              `Pass ${REPAIR_FLAG} with no value to repair every outstanding diagnostic.`
+          );
+        }
+        repair = given;
+        continue;
+      }
+      const next = argv[i + 1];
+      if (next !== undefined && REPAIR_MODULE_RE.test(next.trim())) {
+        repair = next.trim();
+        i += 1;
+      } else {
+        repair = REPAIR_ALL;
+      }
+      continue;
+    }
+
     if ((BOOLEAN_FLAGS as readonly string[]).includes(name)) {
       // A boolean flag takes no value, so it must not swallow the next argv
       // entry — `--force-idea "an app that..."` has to stay idea text.
@@ -1895,7 +2282,7 @@ function parseCliArgs(argv: string[]): CliArgs {
     if (!(FLAGS_WITH_VALUES as readonly string[]).includes(name)) {
       throw new Error(
         `Unrecognised option "${name}". Supported flags are ` +
-          `${[...FLAGS_WITH_VALUES, ...BOOLEAN_FLAGS].join(", ")}.`
+          `${[...FLAGS_WITH_VALUES, ...BOOLEAN_FLAGS, REPAIR_FLAG].join(", ")}.`
       );
     }
     if (value === undefined) {
@@ -1917,6 +2304,22 @@ function parseCliArgs(argv: string[]): CliArgs {
   }
 
   const idea = words.join(" ").trim();
+
+  // `--repair` is a complete alternative to running the pipeline, so idea text
+  // alongside it is never acted on. Silently ignoring it is the dangerous
+  // reading: bare `--repair` takes no value, so
+  // `--repair "an app that does X"` parses as "repair everything, and here is
+  // some text nobody will look at" — someone who meant to start a build would
+  // instead spend money editing an existing workspace's code. Refused rather
+  // than guessed at; nothing has run at this point.
+  if (repair !== null && idea.length > 0) {
+    throw new Error(
+      `${REPAIR_FLAG} does not take an idea, and cannot be combined with one (got "${truncateForMessage(idea)}"). ` +
+        `Use "${REPAIR_FLAG}" alone to repair every outstanding diagnostic, or "${REPAIR_FLAG} M04" ` +
+        `to repair one module's — and run the pipeline as a separate command.`
+    );
+  }
+
   return {
     idea: idea.length > 0 ? idea : null,
     maxModules,
@@ -1925,6 +2328,7 @@ function parseCliArgs(argv: string[]): CliArgs {
     forceIdea,
     installDeps,
     acceptStage,
+    repair,
   };
 }
 
@@ -2133,6 +2537,24 @@ async function main(): Promise<void> {
     console.log("No pipeline stage will run and no run state will be changed.");
     const budget = new RunBudget(MAX_BUDGET_USD_PER_RUN);
     const ok = await invokeCritic(cli.critic, budget);
+    console.log(`Total cost: $${budget.spent.toFixed(4)}`);
+    if (!ok) process.exitCode = 1;
+    return;
+  }
+
+  // --repair is a complete alternative to running the pipeline, handled here for
+  // the same reason --critic is: the repairer is ON DEMAND, so asking for one
+  // must not advance, resume or complete a run as a side effect. It reads the
+  // workspace and the workspace ledger and never touches state/run.json.
+  if (cli.repair !== null) {
+    const moduleId = cli.repair === REPAIR_ALL ? null : cli.repair;
+    reportAuthSource();
+    console.log(
+      `Repairer (on demand) — target: ${moduleId ?? "every outstanding inherited diagnostic"}`
+    );
+    console.log("No pipeline stage will run and no run state will be changed.");
+    const budget = new RunBudget(MAX_BUDGET_USD_PER_RUN);
+    const ok = await invokeRepairer(moduleId, budget);
     console.log(`Total cost: $${budget.spent.toFixed(4)}`);
     if (!ok) process.exitCode = 1;
     return;

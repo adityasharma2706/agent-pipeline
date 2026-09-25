@@ -66,6 +66,60 @@ export interface ModuleProgressEntry {
 }
 
 /**
+ * One on-demand repair session (orchestrator/repair.ts, invokeRepairer).
+ *
+ * WHY THIS IS A SIBLING ARRAY AND NOT AN `entries[]` ENTRY
+ * -------------------------------------------------------
+ * `entries[]` is the MODULE ledger, and two things derive from it that a repair
+ * would corrupt:
+ *
+ *   - `fileOwners()` (baseline.ts) reads `entries[].filesWritten` and gives the
+ *     file to the LAST writer. A repair recorded there would become the owner of
+ *     every file it edited, so every future diagnostic in M04's code would be
+ *     attributed to the repairer instead of to M04 — destroying the exact
+ *     attribution that made this problem diagnosable and that the repairer
+ *     exists because of.
+ *   - `completedModuleIds()` reads `entries[].outcome`, and that set is what a
+ *     re-run skips. A repair is not a module attempt and must never be able to
+ *     mark a module built, or to make one look unbuilt.
+ *
+ * So repairs live in `repairs[]`: same file, because a repair is a fact about
+ * this workspace's code and has to travel with it, and because the reviewer
+ * stage already reads this file. Separate array, because it is a different kind
+ * of event and the module ledger's readers must not see it at all.
+ */
+export interface RepairRecord {
+  /** `R-1`, monotonic within this ledger — the scheme C-n/F-n/RD-n use. */
+  repairId: string;
+  startedAt: string;
+  finishedAt: string;
+  /** The module whose diagnostics were targeted, or null for "all outstanding". */
+  targetModuleId: string | null;
+  /** The tsc lines it was asked to fix, verbatim, as they read before the repair. */
+  targeted: string[];
+  /** Owner breakdown of `targeted`, e.g. "M04 x6, M01 x1". */
+  targetOwners: string;
+  /** Workspace-relative paths observed to change during the call. */
+  filesChanged: string[];
+  /**
+   * `accepted`   - every target fixed, nothing new anywhere; the edits are kept.
+   * `rolled-back`- verification failed or the call failed; workspace restored.
+   * `declined`   - nothing ran and nothing was spent (no git, nothing to fix).
+   */
+  outcome: "accepted" | "rolled-back" | "declined";
+  /** One line saying why the outcome is what it is. */
+  reason: string;
+  /** Targeted diagnostics still present afterwards. Empty on acceptance. */
+  remaining: string[];
+  /** Diagnostics that did not exist before this repair. Empty on acceptance. */
+  regressions: string[];
+  /** The commit the workspace was snapshotted to, and reset to if rejected. */
+  snapshotCommit: string | null;
+  costUsd: number;
+  numTurns: number;
+}
+
+/**
  * Which product a ledger's entries were built from.
  *
  * Module ids are POSITIONAL — every product's docs/implementer.md starts at
@@ -86,11 +140,11 @@ export interface ProgressLog {
   /**
    * Schema marker so a later phase can migrate this file knowingly.
    *
-   * 3 added `entries[].failure`. The bump is additive — v2 entries load
-   * unchanged and simply carry no structured failure — so no migration is
-   * needed and none is performed.
+   * 3 added `entries[].failure`. 4 added `repairs[]`. Both bumps are additive —
+   * a v2 or v3 ledger loads unchanged and simply carries no structured failure
+   * and no repairs — so no migration is needed and none is performed.
    */
-  version: 3;
+  version: 4;
   updatedAt: string;
   /**
    * Provenance of `entries`. Null only for a ledger written before the field
@@ -100,6 +154,11 @@ export interface ProgressLog {
   planHash: string | null;
   ideaHash: string | null;
   entries: ModuleProgressEntry[];
+  /**
+   * On-demand repair sessions. Absent in a v3 ledger and normalised to `[]` on
+   * load, so every reader can treat it as a list without checking.
+   */
+  repairs: RepairRecord[];
 }
 
 /** Normalises away whitespace-only differences before hashing. */
@@ -122,11 +181,12 @@ export function hashDocument(text: string | null): string | null {
 
 function emptyLog(identity: LedgerIdentity | null): ProgressLog {
   return {
-    version: 3,
+    version: 4,
     updatedAt: new Date().toISOString(),
     planHash: identity?.planHash ?? null,
     ideaHash: identity?.ideaHash ?? null,
     entries: [],
+    repairs: [],
   };
 }
 
@@ -177,8 +237,37 @@ function isInheritedDiagnostic(value: unknown): value is InheritedDiagnostic {
     typeof item.diagnostic === "string" &&
     typeof item.file === "string" &&
     typeof item.code === "string" &&
-    (item.reason === "pre-existing" || item.reason === "revealed-by-install") &&
+    (item.reason === "pre-existing" ||
+      item.reason === "revealed-by-install" ||
+      item.reason === "revealed-by-config") &&
     (item.owner === null || typeof item.owner === "string")
+  );
+}
+
+const REPAIR_OUTCOMES: ReadonlySet<string> = new Set(["accepted", "rolled-back", "declined"]);
+
+/**
+ * Validates `repairs[]` when present.
+ *
+ * Rejected rather than repaired, like the other two. This array is the only
+ * durable record that an agent was permitted to edit another module's files and
+ * what came of it; a half-parsed entry is an audit trail that quietly stops
+ * being one.
+ */
+function isRepairRecord(value: unknown): value is RepairRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.repairId === "string" &&
+    (item.targetModuleId === null || typeof item.targetModuleId === "string") &&
+    isStringArray(item.targeted) &&
+    isStringArray(item.filesChanged) &&
+    isStringArray(item.remaining) &&
+    isStringArray(item.regressions) &&
+    typeof item.outcome === "string" &&
+    REPAIR_OUTCOMES.has(item.outcome) &&
+    typeof item.reason === "string" &&
+    (item.snapshotCommit === null || typeof item.snapshotCommit === "string")
   );
 }
 
@@ -220,16 +309,32 @@ export async function loadProgress(): Promise<ProgressLog> {
     );
   }
 
-  const candidate = parsed as { entries?: unknown; planHash?: unknown; ideaHash?: unknown };
+  const candidate = parsed as {
+    entries?: unknown;
+    planHash?: unknown;
+    ideaHash?: unknown;
+    repairs?: unknown;
+  };
   if (!Array.isArray(candidate.entries) || !candidate.entries.every(isEntry)) {
     throw new Error(`${file} does not match the expected progress-log shape. Fix or delete it.`);
   }
+  // Absent in a v3 ledger, which is the normal case for any workspace built
+  // before the repairer existed: that is "no repairs have been run", not a
+  // corrupt file, so it normalises to [] rather than being refused.
+  if (candidate.repairs !== undefined) {
+    if (!Array.isArray(candidate.repairs) || !candidate.repairs.every(isRepairRecord)) {
+      throw new Error(
+        `${file} has a "repairs" array that does not match the expected shape. Fix or delete it.`
+      );
+    }
+  }
   return {
-    version: 3,
+    version: 4,
     updatedAt: new Date().toISOString(),
     planHash: typeof candidate.planHash === "string" ? candidate.planHash : null,
     ideaHash: typeof candidate.ideaHash === "string" ? candidate.ideaHash : null,
     entries: candidate.entries,
+    repairs: Array.isArray(candidate.repairs) ? (candidate.repairs as RepairRecord[]) : [],
   };
 }
 
@@ -334,7 +439,82 @@ function renderMarkdown(log: ProgressLog): string {
     lines.push("");
   }
 
+  if (log.repairs.length > 0) {
+    lines.push("# Repairs (on demand)");
+    lines.push("");
+    lines.push(
+      "Each entry is one `--repair` invocation: an agent permitted to edit files another",
+      "module wrote, in order to fix diagnostics no module owns. A repair is kept only if",
+      "every targeted diagnostic went away AND no new one appeared anywhere; otherwise the",
+      "workspace was reset to the commit named below and nothing was kept."
+    );
+    lines.push("");
+    for (const repair of log.repairs) {
+      lines.push(
+        `## ${repair.repairId} ${repair.targetModuleId ?? "all outstanding"} — ${repair.outcome}`
+      );
+      lines.push("");
+      lines.push(`- Ran: ${repair.startedAt} to ${repair.finishedAt}`);
+      lines.push(`- Cost: $${repair.costUsd.toFixed(4)} over ${repair.numTurns} turns`);
+      lines.push(`- Outcome: ${repair.outcome} — ${repair.reason}`);
+      lines.push(`- Snapshot commit: ${repair.snapshotCommit ?? "(none taken)"}`);
+      lines.push(`- Targeted ${repair.targeted.length} diagnostic(s) [${repair.targetOwners}]:`);
+      for (const line of repair.targeted) lines.push(`  - ${line}`);
+      lines.push(
+        `- Files changed: ${repair.filesChanged.length > 0 ? repair.filesChanged.join(", ") : "(none)"}`
+      );
+      if (repair.remaining.length > 0) {
+        lines.push(`- Still unfixed after the attempt:`);
+        for (const line of repair.remaining) lines.push(`  - ${line}`);
+      }
+      if (repair.regressions.length > 0) {
+        lines.push(`- NEW diagnostics the attempt introduced (why it was rejected):`);
+        for (const line of repair.regressions) lines.push(`  - ${line}`);
+      }
+      lines.push("");
+    }
+  }
+
   return `${lines.join("\n")}\n`;
+}
+
+/** The next `R-n` id for this ledger. Monotonic, never reused. */
+export function nextRepairId(log: ProgressLog): string {
+  let max = 0;
+  for (const repair of log.repairs) {
+    const match = /^R-(\d+)$/.exec(repair.repairId);
+    const n = match === null ? 0 : Number(match[1]);
+    if (Number.isInteger(n) && n > max) max = n;
+  }
+  return `R-${max + 1}`;
+}
+
+/**
+ * Appends one repair session and rewrites both files.
+ *
+ * Declined and rolled-back sessions are appended exactly like accepted ones. A
+ * repair that was rejected is the more interesting record of the two: it says
+ * an agent was pointed at these errors, tried, and could not fix them without
+ * breaking something — which is precisely what a human needs to know before
+ * paying for a second attempt at the same thing.
+ *
+ * Note for callers that roll back: call this AFTER the git restore. A restore
+ * resets tracked files, and this file is tracked, so writing the record first
+ * would erase it.
+ */
+export async function appendRepair(log: ProgressLog, repair: RepairRecord): Promise<ProgressLog> {
+  const next: ProgressLog = {
+    version: 4,
+    updatedAt: new Date().toISOString(),
+    planHash: log.planHash,
+    ideaHash: log.ideaHash,
+    entries: log.entries,
+    repairs: [...log.repairs, repair],
+  };
+  const root = workspaceRoot();
+  await writeFile(path.join(root, PROGRESS_JSON), `${JSON.stringify(next, null, 2)}\n`, "utf-8");
+  await writeFile(path.join(root, PROGRESS_MD), renderMarkdown(next), "utf-8");
+  return next;
 }
 
 /**
@@ -347,11 +527,12 @@ export async function appendProgress(
   entry: ModuleProgressEntry
 ): Promise<ProgressLog> {
   const next: ProgressLog = {
-    version: 3,
+    version: 4,
     updatedAt: new Date().toISOString(),
     planHash: log.planHash,
     ideaHash: log.ideaHash,
     entries: [...log.entries, entry],
+    repairs: log.repairs,
   };
   const root = workspaceRoot();
   await writeFile(path.join(root, PROGRESS_JSON), `${JSON.stringify(next, null, 2)}\n`, "utf-8");

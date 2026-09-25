@@ -103,6 +103,42 @@
       "startedAt": "2026-09-25T01:55:04.532Z",
       "finishedAt": null,
       "outcome": "in-progress"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-25T02:26:59.212Z",
+      "finishedAt": null,
+      "outcome": "in-progress"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-25T07:22:54.637Z",
+      "finishedAt": null,
+      "outcome": "in-progress"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-25T07:23:01.495Z",
+      "finishedAt": null,
+      "outcome": "in-progress"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-25T07:32:11.954Z",
+      "finishedAt": null,
+      "outcome": "in-progress"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-25T07:35:14.650Z",
+      "finishedAt": null,
+      "outcome": "in-progress"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-25T08:15:05.419Z",
+      "finishedAt": "2026-09-25T08:24:59.782Z",
+      "outcome": "partial"
     }
   ],
   "retries": {}

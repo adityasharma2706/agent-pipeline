@@ -17,8 +17,9 @@ alongside the design docs and writes evidence-bearing findings.
 Reaching `reviewer` is no longer the end of a run. `feedback-router` then reads
 those findings and returns routing decisions as SDK **structured output**, and
 a high-confidence decision sends execution **back** to an earlier stage, which
-then re-runs forward from there. `critic` is implemented but **on demand only**
-(`--critic <target>`) — it is never scheduled and never wired into the loop.
+then re-runs forward from there. `critic` and `repairer` are implemented but **on demand only**
+(`--critic <target>`, `--repair [MODULE_ID]`) — neither is scheduled and neither
+is wired into the loop.
 `testing-agent` is the one stage still unimplemented, and it is blocked on a
 dependency rather than merely unscheduled (see below).
 
@@ -179,6 +180,11 @@ To continue where this stopped, run the same command again:
 **`--max-go-backs N`** (default **3**) caps how many times one run may send
 execution back to an earlier stage. **`--critic <target>`** runs a single
 on-demand critic session and nothing else.
+
+**`--repair`** (or **`--repair M04`**) runs a single on-demand repair session
+against typecheck errors that no module owns, and nothing else. It refuses to be
+combined with idea text, because it is an alternative to running the pipeline
+rather than an option on one. See *The repairer* below.
 
 **`--force-idea`** (a switch, off by default) permits replacing `docs/idea.md`
 with a *different* idea while earlier stages have already run against the old
@@ -512,6 +518,43 @@ the `DOM` lib. Without this repo's copy, every generated file touching
 installed — an artefact of an empty `node_modules`, nothing to do with the
 module being judged.
 
+**The rest of that `tsconfig.json` is derived from what the product declares,
+not fixed** (`orchestrator/workspace.ts`, `detectWorkspaceRuntime` /
+`syncWorkspaceTsconfig`). A fixed Node-library config does not merely fail to
+help a web product — it *shapes* it. With a generic
+`NodeNext`/`no-jsx` template and a Next.js product in the workspace, two
+artefacts showed up in real generated code:
+
+- `jsx` unset means `tsc` rejects every `.tsx` file outright (`TS17004`), so the
+  agent — which is verified by this typecheck — wrote every UI component as
+  `createElement as h(...)` calls instead of JSX.
+- `moduleResolution: NodeNext` demands explicit extensions, so
+  `import { notFound } from 'next/navigation'` — the import every Next.js
+  codebase writes — failed `TS2307`, and a repair pass "fixed" it to
+  `'next/navigation.js'`.
+
+Neither is a bug the agent chose; both are the verifier's configuration leaking
+into the product's source. So the config follows the manifest:
+
+| declared | `module` / `moduleResolution` | `jsx` | also |
+| --- | --- | --- | --- |
+| `next` | `esnext` / `bundler` | `preserve` | `allowJs`, `isolatedModules`, `resolveJsonModule`, `esModuleInterop`, `DOM.Iterable` — i.e. what `create-next-app --typescript` generates |
+| `react`, no `next` | `esnext` / `bundler` | `react-jsx` | the automatic runtime, so no `import React` is needed |
+| neither | `NodeNext` / `NodeNext` | unset | byte-for-byte the previous Node-library config; non-web products are unaffected |
+
+`strict: true` is **not** derived. It holds in every case — it is the verifier's
+value, and it is not the kind of thing that gets traded away to make a config
+work.
+
+**When it is re-derived.** Not at bootstrap: the workspace `package.json` starts
+empty and modules add to it, so the answer is unknowable then and `ensureWorkspace`
+can only emit the `node` config. It is re-derived inside `deps.ts`, which already
+exists to notice the declared dependency set moving, on every call and always
+*before* the typecheck it governs. The file is rewritten **only when the derived
+content actually differs**, so an unchanged run does not churn it — and so that
+"the config changed this attempt" stays a true statement, which the next section
+depends on.
+
 **Workspace dependencies: the orchestrator installs them** (`orchestrator/deps.ts`).
 
 Leaving `node_modules` empty had a cost that was invisible because it looked
@@ -668,6 +711,21 @@ fail the module.
   tightly as it can be: only after a real install, only in untouched files, only
   in files whose imports were previously unresolved. It costs no third `tsc`
   run, because the post-install typecheck *is* the verification run.
+- **A tsconfig rewrite mid-stage is the same trap, entered by the other door,
+  and reuses the same rule.** Re-deriving the workspace `tsconfig.json` changes
+  the diagnostic set for the *whole* workspace exactly as an install does. When
+  `deps.tsconfigRewritten` is true — the content genuinely differed and was
+  replaced during this attempt — new diagnostics in files the module did not
+  touch are attributed as `revealed-by-config`. This allowance is deliberately
+  *wider* than the install's: an install can only reveal what an unresolved
+  import was hiding, so `importBlockedFiles` bounds it exactly, whereas turning
+  on `jsx`, `isolatedModules` or a different `lib` produces new diagnostics in
+  files whose imports always resolved. There is no subset of files that safely
+  bounds that, so the bound is the defensible one — rule 1 still runs first, so
+  the module owns every file it *touched*, and it is simply not charged for
+  untouched files on an attempt where the orchestrator changed the compiler out
+  from under it. It fires only when the config actually changed, and never twice
+  for the same change.
 
 **Inherited errors are reported, not swallowed.** Not failing the module is
 right; leaving real bugs unmentioned forever is not. So they are surfaced three
@@ -969,6 +1027,113 @@ message and the *orchestrator* records the session into `docs/critic_log.md`
 under a monotonic `C-n` id. That is what keeps it invokable from any context
 rather than tied to one fixed pipeline document.
 
+### The repairer (on demand, never scheduled)
+
+```
+npm run orchestrator -- --repair          # every outstanding inherited diagnostic
+npm run orchestrator -- --repair M04      # only the ones in files M04 wrote
+```
+
+**What it is for.** Attribution (`orchestrator/baseline.ts`) stops the module
+that happens to be building from being failed for errors in an *earlier*
+module's files. That is correct, and it has a consequence nobody chose: a
+diagnostic ruled "inherited" fails nobody, so **nobody is ever asked to fix
+it**. On a live 53-module build, seven errors in files written by M01 and M04
+were inherited by every module after them. No module-scoped builder is permitted
+to touch another module's files, and the `reviewer` stage that could act on them
+only runs after all 53 modules are built — roughly $121 away. A cross-module
+error had no owner. The repairer is the owner.
+
+**Why it is on demand rather than a stage.** This is evidence, not taste. The
+pipeline's own research file (`docs/okf.md` §4) records that adding roles to a
+multi-agent pipeline is frequently *negative*: a five-role pipeline measured
+lower accuracy than a simpler arrangement (**75% → 45%**), a two-agent team beat
+a three-agent waterfall, and roughly **37%** of observed multi-agent failures
+come from inter-agent misalignment rather than from any single agent being bad
+at its job. Every role added to `PIPELINE_STAGES` is another handoff that can
+misalign, on every run, forever. What is defensible against that research is a
+narrowly-scoped repairer handed an exact list of diagnostics and verified
+mechanically afterwards; what it warns about is a general "fixes anything" role
+sitting in the module loop. So the shape is copied from `critic` — it is **not**
+in `PIPELINE_STAGES`, is never auto-invoked, and nothing in the module loop
+calls it. Like `--critic`, it is a complete alternative to running the pipeline:
+no stage runs and `state/run.json` is not touched.
+
+**It repairs what is broken now, not what was broken then.** Targets come from a
+**fresh `tsc --noEmit`** over the workspace, never from the ledger's stored
+`inheritedDiagnostics`. The ledger records history — errors it lists may since
+have been fixed, moved line, or been joined by ones no module attempt observed.
+The ledger's role here is the narrower thing `tsc` cannot do: mapping each
+diagnostic to the module that wrote the file, via `entries[].filesWritten`.
+
+**Its tools are `Read, Write, Edit, Grep, Glob` — no `Bash`**, per Decision
+LD-1, so it cannot run the compiler and its self-report is never the evidence.
+Its prompt pastes the diagnostics verbatim and in full, which is the opposite of
+what `buildModulePrompt` does with `docs/lld.md`, and deliberately: an agent told
+to "fix the type errors" would have to decide *which*, and that is exactly the
+freedom that must not be given to something editing another module's files. It
+may Grep the owning module's section of `docs/lld.md` and `docs/implementer.md`
+so a fix matches what the module was *specified* to do, and it is told in as
+many words not to reach for `any`, `as unknown as`, `@ts-ignore`, or type
+widening — the same wording the retry-context prompt uses.
+
+#### The rollback guarantee
+
+A repair is **accepted only if both** hold:
+
+1. every targeted diagnostic is gone, **and**
+2. **no new diagnostic appeared anywhere in the workspace.**
+
+Condition 2 is the one that makes this safe. The repairer edits files other
+modules import, and the cheapest way to make seven errors disappear is to change
+a shared signature — which *moves* them to the call sites rather than fixing
+them. Checking only the targeted files would score that as a total success. A
+repair that fixes three errors and introduces two is not a repair, and there is
+no partial credit.
+
+Before the agent runs, the workspace is committed (`orchestrator/vcs.ts`,
+`execFile` on `git`, never a shell — the rule `orchestrator/deps.ts` follows for
+`npm`). If verification fails, the workspace is `reset --hard` to that commit and
+`clean -fd`'d, so **a failed repair leaves nothing behind** — not an edit, and
+not a file the agent created. `clean` is deliberately without `-x`, so
+`node_modules/` survives: deleting an install the orchestrator paid for in order
+to undo an edit would be worse than the edit. A workspace with no commits yet is
+handled by construction — the snapshot simply becomes the repository's first
+commit — and **if git is unavailable at all, the repairer declines to run**
+rather than repairing with no way back.
+
+Comparison is by multiset of `(file, code, message)`, the same identity
+`baseline.ts` uses and for the same reason: a repair edits files, edits move
+lines, and a line-sensitive key would score every surviving error below an edit
+as brand new.
+
+#### Where the outcome is recorded
+
+In the **workspace ledger** (`pipeline-progress.json`), in a **sibling
+`repairs[]` array** rather than in `entries[]`, and the distinction matters.
+`entries[]` is the *module* ledger: `fileOwners()` reads
+`entries[].filesWritten` and gives each file to its last writer, and
+`completedModuleIds()` reads `entries[].outcome` to decide what a re-run skips.
+A repair recorded there would become the owner of every file it edited — so
+every future diagnostic in M04's code would be attributed to the repairer
+instead of to M04, destroying the exact attribution the repairer exists because
+of — and could make a module look built or unbuilt. Same file, because a repair
+is a fact about this workspace's code and has to travel with it (and the
+reviewer stage already reads this file); separate array, because the module
+ledger's readers must not see it at all.
+
+Each record carries an `R-n` id, what it was asked to fix and whose it was, what
+changed, the snapshot commit, cost and turns, and `accepted` / `rolled-back` /
+`declined` with a reason. Rejected sessions are recorded too — arguably the more
+useful of the two, since "an agent was pointed at these and could not fix them
+without breaking something" is what a human needs before paying for a second
+attempt. The ledger is written **after** any rollback, because it is a tracked
+file and a `reset --hard` would erase a record written before it.
+
+The budget cap is `MAX_BUDGET_USD_PER_REPAIR` ($3, below the $8 per-stage cap):
+a repair changes a handful of lines in existing files, and a repairer that has
+spent $3 has stopped doing that and started doing something else.
+
 ### Why `testing-agent` is still unimplemented
 
 It is blocked on a dependency, not merely unscheduled, and the error says so
@@ -1093,7 +1258,18 @@ agent-pipeline/
                                 charges it only what is new or in a file it
                                 touched. Handles the mid-stage dependency
                                 install that changes what `tsc` can see.
-                   progress.ts  the workspace progress log / resume ledger
+                   progress.ts  the workspace progress log / resume ledger,
+                                plus the sibling repairs[] array
+                   repair.ts    the on-demand repairer: which diagnostics to
+                                target, the accept/reject rule (targets gone AND
+                                nothing new anywhere), and the prompt. NO SDK
+                                import, for module-prompt.ts's reason. Its
+                                header has the evidence for why a repairer is an
+                                auxiliary agent and not a pipeline stage.
+                   vcs.ts       snapshot-and-restore of the workspace via
+                                execFile on `git` (never a shell). The rollback
+                                is what makes a repair safe to attempt at all;
+                                handles the no-commits-yet workspace.
                    module-prompt.ts
                                 the per-module spec-implementer prompt.
                                 NO SDK import, so a prompt change can be

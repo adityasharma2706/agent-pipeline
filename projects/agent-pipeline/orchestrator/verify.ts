@@ -320,6 +320,13 @@ export interface AttributionContext {
    * nothing became newly visible to tsc.
    */
   installRan: boolean;
+  /**
+   * Whether the workspace tsconfig was rewritten during this attempt. Same trap
+   * as `installRan` — the orchestrator changed what tsc checks across the whole
+   * workspace while this module was building — and handled by the same rule in
+   * attributeDiagnostics rather than by a parallel one.
+   */
+  tsconfigRewritten: boolean;
   /** file -> owning module, from the ledger's filesWritten (see fileOwners). */
   owners: ReadonlyMap<string, string>;
 }
@@ -332,6 +339,7 @@ export interface AttributionContext {
 export const NO_BASELINE: AttributionContext = {
   baseline: emptyBaseline("none"),
   installRan: false,
+  tsconfigRewritten: false,
   owners: new Map(),
 };
 
@@ -388,6 +396,7 @@ export async function verifyModule(
     baseline: attribution.baseline,
     filesTouched: filesWritten,
     installRan: attribution.installRan,
+    tsconfigRewritten: attribution.tsconfigRewritten,
     owners: attribution.owners,
   });
   const typecheckErrors = attributed.owned;

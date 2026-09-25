@@ -37,7 +37,8 @@ import { createHash } from "node:crypto";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { INSTALL_STATE_FILE, workspaceRoot } from "./workspace.js";
+import { INSTALL_STATE_FILE, syncWorkspaceTsconfig, workspaceRoot } from "./workspace.js";
+import type { WorkspaceRuntime } from "./workspace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -89,6 +90,20 @@ export interface InstallOutcome {
   hash: string | null;
   /** `name@range` for every declared dependency, dependencies then devDependencies. */
   packages: string[];
+  /**
+   * True when the workspace tsconfig was re-derived AND actually rewritten
+   * during this call. Lives here because this is where it happens: the declared
+   * dependency set is the input the config is derived from, and this function is
+   * already the place that notices that set changing.
+   *
+   * It is a second entry into the SAME attribution trap `dependenciesResolved`
+   * guards. A tsconfig change alters the diagnostic set for the whole workspace
+   * exactly as an install does, so whoever happens to be building must not be
+   * charged for what it reveals. See attributeDiagnostics.
+   */
+  tsconfigRewritten: boolean;
+  /** What the tsconfig was derived for, or null when it could not be derived. */
+  tsconfigRuntime: WorkspaceRuntime | null;
   /** Human-facing lines for the run log, in order, each already prefixed `[deps]`. */
   log: string[];
 }
@@ -230,13 +245,33 @@ export interface InstallOptions {
 export async function installWorkspaceDependencies(options: InstallOptions): Promise<InstallOutcome> {
   const root = options.root ?? workspaceRoot();
 
+  // The workspace tsconfig is re-derived here, on EVERY call, and before the
+  // typecheck this function precedes.
+  //
+  // Here, because the config is derived from what package.json declares and
+  // this is already the function that exists to notice that declaration
+  // changing — it hashes the set and installs on change. There is no second
+  // place that knows the dependency set moved.
+  //
+  // On every call rather than only when an install runs, because the two
+  // questions are different: "is node_modules current" and "is the compiler
+  // configured for the kind of product this is". A workspace can have an
+  // unchanged, already-installed dependency set and a stale tsconfig — which is
+  // exactly the state a live workspace was found in. It is cheap and safe to
+  // ask every time because syncWorkspaceTsconfig writes only on a real content
+  // difference.
+  const tsconfig = await syncWorkspaceTsconfig(root);
+
   if (!options.enabled) {
     return {
       status: "disabled",
       dependenciesResolved: false,
       hash: null,
       packages: [],
+      tsconfigRewritten: tsconfig.rewritten,
+      tsconfigRuntime: tsconfig.runtime,
       log: [
+        ...tsconfig.log,
         "[deps] dependency install disabled by --no-install; unresolved third-party imports " +
           "stay warnings and the typecheck cannot see inside files that import them",
       ],
@@ -257,7 +292,10 @@ export async function installWorkspaceDependencies(options: InstallOptions): Pro
       dependenciesResolved: false,
       hash: null,
       packages: [],
+      tsconfigRewritten: tsconfig.rewritten,
+      tsconfigRuntime: tsconfig.runtime,
       log: [
+        ...tsconfig.log,
         manifest
           ? "[deps] workspace package.json declares no dependencies — nothing to install; " +
             "unresolved imports stay warnings"
@@ -275,7 +313,10 @@ export async function installWorkspaceDependencies(options: InstallOptions): Pro
       dependenciesResolved: true,
       hash: declared.hash,
       packages: declared.packages,
+      tsconfigRewritten: tsconfig.rewritten,
+      tsconfigRuntime: tsconfig.runtime,
       log: [
+        ...tsconfig.log,
         `[deps] ${declared.count} declared dependency/ies unchanged since the last successful ` +
           `install (set ${declared.hash.slice(0, 12)}); skipping npm install`,
       ],
@@ -283,6 +324,7 @@ export async function installWorkspaceDependencies(options: InstallOptions): Pro
   }
 
   const log: string[] = [
+    ...tsconfig.log,
     `[deps] installing ${declared.count} dependency/ies declared in the agent-written ` +
       `package.json into ${root}:`,
     ...describePackages(declared),
@@ -307,7 +349,15 @@ export async function installWorkspaceDependencies(options: InstallOptions): Pro
       `[deps] install FAILED — continuing without it; unresolved imports stay warnings and this ` +
         `does NOT fail the module: ${errorDetail(err)}`
     );
-    return { status: "failed", dependenciesResolved: false, hash: declared.hash, packages: declared.packages, log };
+    return {
+      status: "failed",
+      dependenciesResolved: false,
+      hash: declared.hash,
+      packages: declared.packages,
+      tsconfigRewritten: tsconfig.rewritten,
+      tsconfigRuntime: tsconfig.runtime,
+      log,
+    };
   }
 
   const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -324,5 +374,13 @@ export async function installWorkspaceDependencies(options: InstallOptions): Pro
       `now real failures, because every declared package is present`
   );
 
-  return { status: "installed", dependenciesResolved: true, hash: declared.hash, packages: declared.packages, log };
+  return {
+    status: "installed",
+    dependenciesResolved: true,
+    hash: declared.hash,
+    packages: declared.packages,
+    tsconfigRewritten: tsconfig.rewritten,
+    tsconfigRuntime: tsconfig.runtime,
+    log,
+  };
 }
