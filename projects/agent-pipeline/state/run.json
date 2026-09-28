@@ -175,6 +175,12 @@
       "startedAt": "2026-09-27T17:58:56.099Z",
       "finishedAt": "2026-09-27T18:50:07.569Z",
       "outcome": "partial"
+    },
+    {
+      "stage": "spec-implementer",
+      "startedAt": "2026-09-28T06:44:30.117Z",
+      "finishedAt": "2026-09-28T07:07:19.315Z",
+      "outcome": "partial"
     }
   ],
   "retries": {}
