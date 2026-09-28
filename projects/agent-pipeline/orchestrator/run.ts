@@ -34,7 +34,7 @@
 //   3. cwd was always PROJECT_ROOT     -> StageIo.cwd is "project" | "workspace"
 //   4. the budget cap was per-query()  -> RunBudget caps the whole run
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
@@ -126,15 +126,20 @@ import type { ModuleFailureRecord, PriorAttempt } from "./retry-context.js";
 import { DOCS_DIR, IMPLEMENTER_DOC, buildModulePrompt } from "./module-prompt.js";
 import {
   DeterministicStageFailure,
+  EnvironmentalHalt,
   ModuleAttemptsExhausted,
-  UsageLimitHalt,
   buildDeterministicHaltMessage,
+  buildEnvironmentalHaltMessage,
   buildModuleExhaustedHaltMessage,
-  buildUsageLimitHaltMessage,
   classifyResult,
-  detectUsageLimit,
+  describeEnvironmentalBlock,
+  detectEnvironmentalBlock,
 } from "./result-failure.js";
-import type { ArtifactStatus, DeterministicFailure, UsageLimit } from "./result-failure.js";
+import type {
+  ArtifactStatus,
+  DeterministicFailure,
+  EnvironmentalBlock,
+} from "./result-failure.js";
 
 /**
  * The pipeline is non-interactive: there is no human sitting there to answer a
@@ -629,13 +634,15 @@ interface QueryOutcome {
    */
   deterministic: DeterministicFailure | null;
   /**
-   * Set when the call was blocked by the ACCOUNT rather than by anything in
-   * this run: a usage/session/rate limit. The caller must halt without
-   * recording an attempt — the agent never ran, so charging the module for it
-   * (which is what happened to M05 on a live run, three times) blames the code
-   * for the billing state and leaves the next run with no budget to resume on.
+   * Set when the call was blocked by the ENVIRONMENT rather than by anything in
+   * this run: the account's usage/session/rate limit, or the CLI refusing to
+   * skip permission prompts because the process is running as root. The caller
+   * must halt without recording an attempt — the agent never ran, so charging
+   * the module for it (which happened to M05 three times on one live run, and
+   * to M24 three times on another) blames the code for the environment and
+   * leaves the next run with no budget to resume on.
    */
-  usageLimit: UsageLimit | null;
+  environmental: EnvironmentalBlock | null;
 }
 
 /**
@@ -697,7 +704,7 @@ async function runQueryOnce(
     numTurns: 0,
     structuredOutput: undefined,
     deterministic: null,
-    usageLimit: null,
+    environmental: null,
   };
   let sawResultMessage = false;
 
@@ -715,12 +722,12 @@ async function runQueryOnce(
         numTurns: message.num_turns,
         structuredOutput: message.subtype === "success" ? message.structured_output : undefined,
         deterministic: classification.kind === "deterministic" ? classification.failure : null,
-        usageLimit: classification.kind === "limit" ? classification.limit : null,
+        environmental: classification.kind === "environmental" ? classification.block : null,
       };
-      if (classification.kind === "limit") {
+      if (classification.kind === "environmental") {
         console.error(
-          `  [${label}] blocked by a ${classification.limit.signal} — NOT retrying and NOT ` +
-            `counting this as an attempt.`
+          `  [${label}] blocked by the environment (${describeEnvironmentalBlock(classification.block)}) ` +
+            `— NOT retrying and NOT counting this as an attempt.`
         );
       } else if (classification.kind === "deterministic") {
         console.error(
@@ -735,21 +742,24 @@ async function runQueryOnce(
     // A thrown SDK error is transient by default: it never carried a result
     // subtype, so there is nothing to classify and the retry budget applies.
     const detail = err instanceof Error ? err.message : String(err);
-    // ...unless it is an environmental block. The CLI surfaces a usage limit as
-    // a thrown "Claude Code returned an error result: You've hit your session
-    // limit · resets ..." rather than as a result message, so this is the path
-    // that actually sees it. detectUsageLimit returns null when unsure, which
-    // leaves the pre-existing transient behaviour exactly as it was.
-    const usageLimit = detectUsageLimit(detail);
-    if (usageLimit !== null) {
+    // ...unless it is an environmental block. The CLI surfaces both kinds as a
+    // thrown error rather than as a result message — "Claude Code returned an
+    // error result: You've hit your session limit · resets ...", and "Claude
+    // Code process exited with code 1. stderr: --dangerously-skip-permissions
+    // cannot be used with root/sudo privileges for security reasons" — so this
+    // is the path that actually sees them. detectEnvironmentalBlock returns
+    // null when unsure, which leaves the pre-existing transient behaviour
+    // exactly as it was.
+    const environmental = detectEnvironmentalBlock(detail);
+    if (environmental !== null) {
       console.error(
-        `  [${label}] blocked by a ${usageLimit.signal} — NOT retrying and NOT counting this ` +
-          `as an attempt.`
+        `  [${label}] blocked by the environment (${describeEnvironmentalBlock(environmental)}) — ` +
+          `NOT retrying and NOT counting this as an attempt.`
       );
     } else {
       console.error(`  [${label}] SDK call threw: ${detail}`);
     }
-    return { ...outcome, ok: false, text: detail, deterministic: null, usageLimit };
+    return { ...outcome, ok: false, text: detail, deterministic: null, environmental };
   }
 
   if (!sawResultMessage) {
@@ -761,7 +771,8 @@ async function runQueryOnce(
 }
 
 /**
- * Halts the run when a call was blocked by a usage/session/rate limit.
+ * Halts the run when a call was blocked by the environment: the account's usage
+ * limit, or the CLI refusing to skip permission prompts under root.
  *
  * The third category alongside the two that already existed: a fatal config
  * fault throws, a transient SDK error is retried, and an ENVIRONMENTAL BLOCK
@@ -769,11 +780,15 @@ async function runQueryOnce(
  * query(), before any verification, ledger write or retry decision, because
  * the whole point is that no record of an attempt is made.
  */
-function haltIfUsageLimit(label: string, outcome: QueryOutcome): void {
-  if (outcome.usageLimit === null) return;
-  throw new UsageLimitHalt(
-    buildUsageLimitHaltMessage({ label, limit: outcome.usageLimit, costUsd: outcome.costUsd }),
-    outcome.usageLimit
+function haltIfEnvironmentalBlock(label: string, outcome: QueryOutcome): void {
+  if (outcome.environmental === null) return;
+  throw new EnvironmentalHalt(
+    buildEnvironmentalHaltMessage({
+      label,
+      block: outcome.environmental,
+      costUsd: outcome.costUsd,
+    }),
+    outcome.environmental
   );
 }
 
@@ -804,7 +819,7 @@ async function runDocumentStage(
     }
   );
   budget.record(outcome.costUsd);
-  haltIfUsageLimit(stageName, outcome);
+  haltIfEnvironmentalBlock(stageName, outcome);
 
   // A cap failure is fatal, not retryable — the same idiom runStage already
   // uses for configuration faults. Before halting, LOOK AT WHAT WAS WRITTEN:
@@ -993,6 +1008,16 @@ function reportInheritedAtStageEnd(inherited: readonly InheritedDiagnostic[]): v
   );
 }
 
+/** Does this path exist? Used for one "were the types actually installed" check. */
+async function pathExists(target: string): Promise<boolean> {
+  try {
+    await stat(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function runModuleStage(
   stageName: PipelineStage,
   definition: AgentDefinition,
@@ -1044,6 +1069,36 @@ async function runModuleStage(
 
   const notes: string[] = [];
   let built = 0;
+
+  // THE BOOTSTRAP INSTALL — before the first module's call, not after it.
+  //
+  // The workspace declares `@types/node` for itself at bootstrap (see
+  // workspaceTsconfig: that declaration is what lets the committed tsconfig keep
+  // `typeRoots` relative instead of naming a path inside THIS repo). A
+  // declaration is not a type: until something installs it, `process`, `Buffer`
+  // and `console` are TS2304 in every generated file.
+  //
+  // The per-module install runs AFTER a module's call, which is right for
+  // dependencies that module just declared and too late for this one — module 1
+  // would be verified against a workspace with no Node types and fail for a
+  // reason it did not cause. Hence one install here, before anything is built.
+  // It is the same hash-gated function, so once the declared set is installed
+  // the per-module calls report "unchanged" and cost nothing; this adds one npm
+  // call to a cold workspace and none to a warm one.
+  const bootstrapDeps = await installWorkspaceDependencies({ enabled: installDeps });
+  for (const line of bootstrapDeps.log) console.log(`  ${line}`);
+  if (!(await pathExists(path.join(bootstrap.root, "node_modules", "@types", "node")))) {
+    // Loud rather than fatal, and specific about the symptom, because this is
+    // the one state in which every module fails identically for something no
+    // module did: --no-install, no network, or a registry that said no.
+    console.warn(
+      `  [deps] WARNING: @types/node is declared but not installed in ${bootstrap.root}. ` +
+        `Generated code using process/Buffer/console will fail the typecheck with TS2304 ` +
+        `"cannot find name", and that is the environment, not the module. Run ` +
+        `\`npm install --ignore-scripts\` in the workspace (or drop --no-install) before ` +
+        `trusting a module failure.`
+    );
+  }
 
   // THE TYPECHECK BASELINE — see orchestrator/baseline.ts for the incident.
   //
@@ -1146,10 +1201,12 @@ async function runModuleStage(
         }
       );
       budget.record(outcome.costUsd);
-      // BEFORE the snapshot, the typecheck and the ledger write: a limit means
-      // the agent never ran, so there is no attempt to record and nothing to
-      // verify. Recording one here is the bug this guard exists for.
-      haltIfUsageLimit(`${stageName}/${spec.id}`, outcome);
+      // BEFORE the snapshot, the typecheck and the ledger write: an
+      // environmental block means the agent never ran, so there is no attempt
+      // to record and nothing to verify. Recording one here is the bug this
+      // guard exists for — it cost M05 and M24 their whole attempt budgets on
+      // two separate live runs.
+      haltIfEnvironmentalBlock(`${stageName}/${spec.id}`, outcome);
       aggregate.costUsd += outcome.costUsd;
       aggregate.numTurns += outcome.numTurns;
 
@@ -1437,7 +1494,7 @@ async function invokeFeedbackRouter(
     outputSchema: ROUTER_OUTPUT_SCHEMA,
   });
   budget.record(outcome.costUsd);
-  haltIfUsageLimit("feedback-router", outcome);
+  haltIfEnvironmentalBlock("feedback-router", outcome);
 
   const base = { costUsd: outcome.costUsd, numTurns: outcome.numTurns, decisions: [] };
   if (!outcome.ok) {
@@ -1703,7 +1760,7 @@ async function invokeCritic(target: string, budget: RunBudget): Promise<boolean>
     additionalDirectories: [workspaceRoot()],
   });
   budget.record(outcome.costUsd);
-  haltIfUsageLimit("critic", outcome);
+  haltIfEnvironmentalBlock("critic", outcome);
 
   if (outcome.deterministic !== null) {
     // The critic is a single on-demand call with no retry loop, so this only
@@ -1961,7 +2018,7 @@ async function invokeRepairer(moduleId: string | null, budget: RunBudget): Promi
     additionalDirectories: [DOCS_DIR],
   });
   budget.record(outcome.costUsd);
-  haltIfUsageLimit("repairer", outcome);
+  haltIfEnvironmentalBlock("repairer", outcome);
 
   const changed = changedFiles(snapshotBefore, await snapshotWorkspace());
 

@@ -60,13 +60,13 @@ export type ResultClassification =
   | { kind: "success" }
   | { kind: "transient"; subtype: string }
   | { kind: "deterministic"; failure: DeterministicFailure }
-  | { kind: "limit"; limit: UsageLimit };
+  | { kind: "environmental"; block: EnvironmentalBlock };
 
 // ---------------------------------------------------------------------------
 // The third category: an ENVIRONMENTAL BLOCK.
 //
 // A fatal config fault throws and is never retried. A transient SDK error is
-// retried. A usage/session/rate limit is neither: the agent never ran, nothing
+// retried. An environmental block is neither: the agent never ran, nothing
 // was written, and no amount of retrying can succeed until the provider's
 // clock says so. Charging it to MAX_ATTEMPTS_PER_MODULE blames the module for
 // the account's billing state — which is exactly what happened on a live run:
@@ -78,6 +78,16 @@ export type ResultClassification =
 // Three attempts gone, and the NEXT run halts on M05 with "no budget left"
 // while nothing is wrong with M05. So this halts the run without recording an
 // attempt at all.
+//
+// There is now more than one way for the environment to block a call, so the
+// category is a union (EnvironmentalBlock, below). The second member arrived
+// the same way the first did — from a live run, three attempts at M24 burned at
+// $0.0000 each, the agent never started:
+//
+//   Claude Code process exited with code 1. stderr: --dangerously-skip-permissions
+//   cannot be used with root/sudo privileges for security reasons
+//
+// Same shape, same remedy in the code: detect it, halt, charge nobody.
 // ---------------------------------------------------------------------------
 
 /** A detected usage/session/rate limit, with the provider's own words kept. */
@@ -151,20 +161,6 @@ export function detectUsageLimit(text: string | null | undefined): UsageLimit | 
   return null;
 }
 
-/**
- * Thrown instead of recording a failed attempt. main()'s catch prints it as a
- * halt, exactly like DeterministicStageFailure — same idiom, different cause.
- */
-export class UsageLimitHalt extends Error {
-  readonly limit: UsageLimit;
-
-  constructor(message: string, limit: UsageLimit) {
-    super(message);
-    this.name = "UsageLimitHalt";
-    this.limit = limit;
-  }
-}
-
 export interface UsageLimitHaltContext {
   /** Stage name, or "spec-implementer/M05". */
   label: string;
@@ -208,6 +204,181 @@ export function buildUsageLimitHaltMessage(ctx: UsageLimitHaltContext): string {
   return lines.join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// The second kind of environmental block: the CLI REFUSING THE PERMISSION MODE.
+//
+// orchestrator/run.ts sets `permissionMode: "bypassPermissions"` because this
+// process is non-interactive: there is no human here to answer a permission
+// prompt, so a prompt is a hang, not a question. The Claude Code CLI turns that
+// into `--dangerously-skip-permissions`, and refuses to honour it when the
+// process is running as root:
+//
+//   Claude Code process exited with code 1. stderr: --dangerously-skip-permissions
+//   cannot be used with root/sudo privileges for security reasons
+//
+// That refusal happens BEFORE the agent exists. It cost $0.0000, wrote nothing,
+// and an identical re-run is refused identically — so it belongs with the usage
+// limit and not with the module: on a live cloud run it consumed all three of
+// M24's attempts and left the ledger with three failures M24 did not earn.
+// ---------------------------------------------------------------------------
+
+/** The CLI's refusal to run with permission prompts skipped, verbatim. */
+export interface PermissionModeRefusal {
+  /** The CLI's message, trimmed but otherwise untouched. */
+  cliText: string;
+}
+
+/**
+ * The two halves that must BOTH be present for this to be a permission-mode
+ * refusal, kept separate so each can be narrow on its own.
+ *
+ * Same discipline as USAGE_LIMIT_PATTERNS, which refuses to match a bare
+ * "limit": a false positive here means a real failure is never retried and a
+ * human is told their container is misconfigured when it is not.
+ *
+ *  - FLAG is the CLI's own flag name. It is distinctive enough that it does not
+ *    occur in ordinary failure prose, but it DOES occur in documentation, in
+ *    `--help` output, and in any error that merely mentions the flag — so it is
+ *    not sufficient on its own.
+ *  - PRIVILEGE is the refusal itself, and requires root/sudo to appear joined to
+ *    the refusal wording rather than anywhere in the text: either "<root|sudo>
+ *    ... privilege(s)" or "cannot/can not be used with ... <root|sudo>". A
+ *    generated project that merely writes about running as root cannot match
+ *    this, because it would also have to name the flag in the same message.
+ */
+const PERMISSION_REFUSAL_FLAG_RE = /--dangerously-skip-permissions/i;
+const PERMISSION_REFUSAL_PRIVILEGE_RE =
+  /\b(?:root|sudo)\b[^\n]{0,40}\bprivileges?\b|\bcan(?:not|'t| not)\s+be\s+used\s+with\b[^\n]{0,40}\b(?:root|sudo)\b/i;
+
+/**
+ * Detects the CLI refusing `--dangerously-skip-permissions` under root.
+ *
+ * Returns null when unsure, exactly like detectUsageLimit: the caller then
+ * behaves as it did before this function existed, which is to retry.
+ */
+export function detectPermissionModeRefusal(
+  text: string | null | undefined
+): PermissionModeRefusal | null {
+  if (typeof text !== "string" || text.trim().length === 0) return null;
+  if (!PERMISSION_REFUSAL_FLAG_RE.test(text)) return null;
+  if (!PERMISSION_REFUSAL_PRIVILEGE_RE.test(text)) return null;
+  return { cliText: text.trim() };
+}
+
+/**
+ * Everything that means "the environment blocked this call, the agent never
+ * ran, do not retry and do not charge a module for it".
+ */
+export type EnvironmentalBlock =
+  | { kind: "usage-limit"; limit: UsageLimit }
+  | { kind: "permission-mode-refused"; refusal: PermissionModeRefusal };
+
+/** One short phrase for the run log, e.g. "blocked by a ${...}". */
+export function describeEnvironmentalBlock(block: EnvironmentalBlock): string {
+  return block.kind === "usage-limit"
+    ? block.limit.signal
+    : "permission mode the CLI refuses to run as root";
+}
+
+/**
+ * The single entry point the call sites use. Order matters only in that the
+ * two detectors are disjoint in practice; each returns null when unsure, so a
+ * text matching neither falls through to the pre-existing transient behaviour.
+ */
+export function detectEnvironmentalBlock(
+  text: string | null | undefined
+): EnvironmentalBlock | null {
+  const refusal = detectPermissionModeRefusal(text);
+  if (refusal !== null) return { kind: "permission-mode-refused", refusal };
+  const limit = detectUsageLimit(text);
+  if (limit !== null) return { kind: "usage-limit", limit };
+  return null;
+}
+
+export interface EnvironmentalHaltContext {
+  /** Stage name, or "spec-implementer/M24". */
+  label: string;
+  block: EnvironmentalBlock;
+  /** What this blocked call was billed; $0.0000 for a refusal, by definition. */
+  costUsd: number;
+}
+
+/**
+ * The halt message for the CLI refusing the permission mode.
+ *
+ * Longer than the usage-limit one, and for the opposite reason: waiting fixes a
+ * usage limit and nothing fixes this until a human changes the environment. So
+ * it says what the orchestrator asked for, why the CLI said no, and the two
+ * ways out — with the sandbox escape hatch stated as the conditional thing it
+ * is, because the check it disables is the only thing standing between an agent
+ * with prompts skipped and a machine that matters.
+ */
+export function buildPermissionRefusalHaltMessage(
+  ctx: EnvironmentalHaltContext & { block: { kind: "permission-mode-refused" } }
+): string {
+  return [
+    `Stopped at "${ctx.label}": the Claude Code CLI refused the permission mode this`,
+    `orchestrator asks for, because this process is running as root.`,
+    ``,
+    `  cli said: ${ctx.block.refusal.cliText}`,
+    `  cost:     ${usd(ctx.costUsd)}`,
+    ``,
+    `NOTHING IS WRONG WITH THE CODE, THE PLAN, OR THE MODULE. The agent never started, so`,
+    `this was not counted as an attempt and no retry budget was spent on it.`,
+    ``,
+    `What is actually happening: this machine runs the pipeline as root. The orchestrator is`,
+    `non-interactive — there is no human here to answer a permission prompt — so it asks the`,
+    `CLI to skip those prompts (permissionMode: "bypassPermissions" in orchestrator/run.ts,`,
+    `which the CLI receives as --dangerously-skip-permissions). The CLI blocks that`,
+    `combination deliberately: as root, a skipped prompt is unrestricted access to the whole`,
+    `machine. Re-running changes nothing — the refusal happens before the agent exists.`,
+    ``,
+    `Pick one of these:`,
+    ``,
+    `  1. Run the pipeline as a non-root user. This is the cleaner fix wherever the`,
+    `     environment allows it: use an ordinary user that owns this repo and the`,
+    `     workspace, and run the same command as them.`,
+    ``,
+    `  2. If this environment genuinely is a disposable container — a cloud sandbox, a CI`,
+    `     runner, something whose whole filesystem you are willing to lose — tell the CLI`,
+    `     so:`,
+    ``,
+    `       IS_SANDBOX=1 npm run orchestrator`,
+    ``,
+    `     Do NOT set IS_SANDBOX on a normal machine and do not put it in a shell profile.`,
+    `     The root check exists to prevent exactly that case, and IS_SANDBOX=1 is you`,
+    `     asserting this machine is throwaway.`,
+    ``,
+    `Completed modules are skipped, not rebuilt.`,
+  ].join("\n");
+}
+
+/** Dispatches to the message for whichever block this is. */
+export function buildEnvironmentalHaltMessage(ctx: EnvironmentalHaltContext): string {
+  if (ctx.block.kind === "permission-mode-refused") {
+    return buildPermissionRefusalHaltMessage({ ...ctx, block: ctx.block });
+  }
+  return buildUsageLimitHaltMessage({
+    label: ctx.label,
+    limit: ctx.block.limit,
+    costUsd: ctx.costUsd,
+  });
+}
+
+/**
+ * Thrown instead of recording a failed attempt. main()'s catch prints it as a
+ * halt, exactly like DeterministicStageFailure — same idiom, different cause.
+ */
+export class EnvironmentalHalt extends Error {
+  readonly block: EnvironmentalBlock;
+
+  constructor(message: string, block: EnvironmentalBlock) {
+    super(message);
+    this.name = "EnvironmentalHalt";
+    this.block = block;
+  }
+}
+
 /**
  * Whatever error prose a result message carries: the `errors` array on the
  * error variants, or `result` on a `success`-subtype message flagged is_error.
@@ -232,12 +403,12 @@ function resultErrorText(message: SDKResultMessage): string {
 export function classifyResult(message: SDKResultMessage): ResultClassification {
   if (message.subtype === "success" && !message.is_error) return { kind: "success" };
 
-  // Before anything else: an environmental limit is not the module's failure
-  // and not a cap of ours. In practice the CLI raises this as a thrown error
-  // rather than a result message (runQueryOnce's catch handles that path), but
+  // Before anything else: an environmental block is not the module's failure
+  // and not a cap of ours. In practice the CLI raises these as thrown errors
+  // rather than result messages (runQueryOnce's catch handles that path), but
   // the same text can arrive here, and it must mean the same thing in both.
-  const limit = detectUsageLimit(resultErrorText(message));
-  if (limit !== null) return { kind: "limit", limit };
+  const block = detectEnvironmentalBlock(resultErrorText(message));
+  if (block !== null) return { kind: "environmental", block };
 
   // `message.subtype !== "success"` first: that is what narrows the union to
   // SDKResultError, which is the variant carrying `errors`. isDeterministic-

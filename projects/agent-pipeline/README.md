@@ -367,11 +367,17 @@ artifact is real, not that it belongs to the current idea. A leftover document
 from a previous product would pass. That is what "you are vouching for it"
 means.
 
-### Usage limits are not the module's fault
+### Environmental blocks are not the module's fault
 
 A third category sits alongside the two above: an **environmental block**. A
 fatal configuration fault throws and is never retried; a transient SDK error is
-retried; a usage/session/rate limit is *neither*.
+retried; an environmental block is *neither* — the agent never started, so
+there is nothing to retry and nobody to charge.
+
+Two things count as one today: the account's **usage/session/rate limit**, and
+the CLI **refusing the permission mode** because the process is running as root.
+Both are detected by `detectEnvironmentalBlock` (`orchestrator/result-failure.ts`)
+and both halt through `haltIfEnvironmentalBlock` without recording an attempt.
 
 It looks like this, from a live run:
 
@@ -388,7 +394,7 @@ run would then have halted on `M05` with "no budget left" while nothing
 whatsoever was wrong with `M05`.
 
 So `detectUsageLimit` (`orchestrator/result-failure.ts`) classifies it and the
-run **halts without recording an attempt**. `haltIfUsageLimit` is called
+run **halts without recording an attempt**. `haltIfEnvironmentalBlock` is called
 immediately after every `query()` — before the workspace snapshot, the
 typecheck, the verification and the ledger write — because the entire point is
 that no attempt is written down. It covers the document stages, the module
@@ -441,6 +447,73 @@ One deliberate omission: there is no automatic cleanup of limit-caused entries
 already in a ledger. The three bogus `M05` rows the bug wrote were removed by
 hand, once. "Purge failures on load" is a rule that would eventually delete real
 history.
+
+#### The same shape again: a refused permission mode
+
+The pipeline is non-interactive, so it asks the CLI to skip permission prompts
+(`permissionMode: 'bypassPermissions'`, which the CLI receives as
+`--dangerously-skip-permissions`). The CLI **refuses that flag when the process
+is running as root**, because a skipped prompt as root is unrestricted access to
+the machine. Resuming a build in a cloud container — which runs as root — hit it
+immediately:
+
+```
+Claude Code process exited with code 1. stderr: --dangerously-skip-permissions
+cannot be used with root/sudo privileges for security reasons
+```
+
+`$0.0000`, no turns, no files: the agent never existed. And the module loop
+counted it as a failed attempt at `M24`, three times, exactly as it once did to
+`M05`. Same category, same fix — halt, charge nothing.
+
+Detection requires **both** halves, case-insensitively:
+
+| half | pattern | why not on its own |
+| --- | --- | --- |
+| the flag | `--dangerously-skip-permissions` | appears in `--help` output, docs and any error that merely mentions it |
+| the refusal | `<root\|sudo> … privilege(s)` **or** `cannot be used with … <root\|sudo>` | "must not run as root" is ordinary prose, and generated products write about `sudo` |
+
+Requiring the flag *and* a refusal joined to root/sudo is what keeps it from
+swallowing unrelated failures: an `EACCES … /root/.npm` from npm, a generated
+README warning against running as root, or a `TS2304: Cannot find name 'sudo'`
+all match at most one half and fall straight through to the pre-existing
+transient behaviour. Same discipline as the usage-limit matcher, which refuses
+to fire on a bare "limit".
+
+The halt message says what was asked for, why the CLI said no, and the two ways
+out:
+
+```
+Stopped at "spec-implementer/M24": the Claude Code CLI refused the permission mode this
+orchestrator asks for, because this process is running as root.
+
+  cli said: Claude Code process exited with code 1. stderr: --dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons
+  cost:     $0.0000
+
+NOTHING IS WRONG WITH THE CODE, THE PLAN, OR THE MODULE. The agent never started, so
+this was not counted as an attempt and no retry budget was spent on it.
+
+...
+
+  1. Run the pipeline as a non-root user. This is the cleaner fix wherever the
+     environment allows it: use an ordinary user that owns this repo and the
+     workspace, and run the same command as them.
+
+  2. If this environment genuinely is a disposable container — a cloud sandbox, a CI
+     runner, something whose whole filesystem you are willing to lose — tell the CLI
+     so:
+
+       IS_SANDBOX=1 npm run orchestrator
+
+     Do NOT set IS_SANDBOX on a normal machine and do not put it in a shell profile.
+     The root check exists to prevent exactly that case, and IS_SANDBOX=1 is you
+     asserting this machine is throwaway.
+```
+
+`IS_SANDBOX=1` is stated as the conditional thing it is. It disables the only
+check standing between an agent with prompts skipped and a machine that matters,
+so it belongs in a throwaway container and nowhere else — least of all in a
+shell profile.
 
 ### Safety rails
 
@@ -511,12 +584,43 @@ not the agent, on first use: it creates the directory, a `package.json`, a
 so the product has its own history. It is idempotent — an existing workspace is
 never clobbered, and `setup.sh` never touches it.
 
-That workspace `tsconfig.json` points `typeRoots` at the workspace's own
-`node_modules/@types` *and* at **this** repo's installed `@types`, and includes
-the `DOM` lib. Without this repo's copy, every generated file touching
-`process`/`console` would fail on `TS2304: cannot find name` before anything is
-installed — an artefact of an empty `node_modules`, nothing to do with the
-module being judged.
+That workspace `tsconfig.json` contains **only relative paths**, and that is
+load-bearing: it is committed to the generated product's own git history, so an
+absolute path in it is wrong on every machine except the one that wrote it. It
+used to carry this repo's own `@types` directory as a second `typeRoots` entry —
+`/Users/<me>/agent-files/.../node_modules/@types` on the Mac, rewritten to
+`/home/user/...` the moment the same build was resumed in a Linux container, and
+pointing at nothing at all on a third checkout. Every machine rewrote a
+committed file, and a rewrite is not free: it buys the module being built an
+attribution allowance for a change it did not cause.
+
+The borrowing existed because `process`/`Buffer`/`console` are `TS2304: cannot
+find name` in a workspace with an empty `node_modules` — which would fail every
+module for something no module did. That predates `orchestrator/deps.ts`. The
+workspace is now **self-sufficient** instead: bootstrap declares `@types/node` in
+the workspace's *own* `package.json` (`ensureNodeTypesDeclared` also adds it to a
+workspace bootstrapped before this change, without overwriting a version the
+product chose), and the ordinary dependency install puts it under
+`./node_modules/@types`. `typeRoots` is therefore just `["./node_modules/@types"]`,
+and `lib` still includes `DOM` for the browser-side half of the problem.
+
+**Ordering**, which is the whole difficulty: the per-module install runs *after*
+a module's call, because that is when `package.json` may have just gained
+entries — too late for module 1, which would be typechecked against a workspace
+with no Node types. So `runModuleStage` runs one hash-gated install at stage
+start, before the first `query()` and before the typecheck baseline. On a warm
+workspace it reports "unchanged" and costs nothing. If that install cannot run
+(`--no-install`, no network, a registry that says no), the run logs a loud
+`@types/node is declared but not installed` warning naming `TS2304` as the
+symptom, so a module failure caused by the environment is not read as a module
+failure.
+
+One consequence worth knowing: because the workspace now always declares at
+least one dependency, a successful install makes `dependenciesResolved` true
+from the first module onwards, so an import the agent never declared is a real
+failure (`TS2307`) from module 1 rather than a warning. That is the intended
+meaning of that flag; it simply used to be unreachable until the agent declared
+something.
 
 **The rest of that `tsconfig.json` is derived from what the product declares,
 not fixed** (`orchestrator/workspace.ts`, `detectWorkspaceRuntime` /
